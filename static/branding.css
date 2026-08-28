@@ -1,0 +1,82 @@
+.brand-mark {
+  display: block;
+  object-fit: contain;
+  background: none !important;
+  border-radius: 7px;
+}
+.mail-metrics { display: flex; gap: 7px; align-items: center; }
+.mail-metrics span {
+  font-size: 11px;
+  color: #777b88;
+  background: #f5f4fb;
+  border: 1px solid #ebe9f7;
+  border-radius: 8px;
+  padding: 7px 9px;
+}
+.mail-metrics b { color: #6558d3; font-size: 14px; margin-left: 4px; }
+@media (max-width: 850px) { .mail-metrics { display: none; } }
+
+/* Keep imported technical mail content inside its own column. */
+.ticket-card { overflow: hidden; }
+.ticket-card .subject {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  max-height: 2.9em;
+}
+.ticket-card .preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+  max-height: 2.9em;
+}
+.mailbox > span { flex: 1; min-width: 0; overflow: hidden; }
+.mailbox > b { flex: none; }
+
+.ticket-detail { overflow-x: hidden; }
+.detail-head-top { align-items: flex-start; gap: 18px; }
+.detail-head-top > div:first-child { flex: 1; min-width: 0; }
+.detail-head h2 {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+.detail-actions {
+  flex: none;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 52%;
+}
+.contact-strip { flex-wrap: wrap; row-gap: 8px; }
+.ticket-category-field{margin-left:auto;display:grid;grid-template-columns:auto minmax(150px,210px);align-items:center;gap:3px 8px;padding:7px 10px;border:1px solid #e4e2ee;border-radius:10px;background:#faf9ff}.ticket-category-field>span{font-size:11px;color:#777b88}.ticket-category-field select,.ticket-category-field input{min-width:0;border:0;background:transparent;color:#5144b8;font-weight:700;outline:0}.ticket-category-field input{width:190px}.ticket-category-field small{grid-column:2;color:#9294a0;font-size:9px;white-space:nowrap}
+.conversation { width: 100%; min-width: 0; }
+.message-body { min-width: 0; }
+.bubble {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
+}
+
+@media (max-width: 1100px) {
+  .detail-head-top { display: block; }
+  .detail-actions { max-width: none; margin: 14px 0 0; justify-content: flex-start; }
+  .workspace { grid-template-columns: minmax(320px, 46%) 1fr; }
+  .ticket-category-field{margin-left:0}
+}
+.badge.ai-category { color: #5b4cc4; background: #efedff; }
+.badge.ai-category.spam { color: #a14b55; background: #fff0f1; }
+.message-translate{border:0;background:transparent;color:#6558d3;font:inherit;cursor:pointer;margin-left:7px;padding:0}.message-translate:disabled{color:#999;cursor:wait}.message-translation{margin-top:8px;padding:10px 12px;border-left:3px solid #6558d3;border-radius:6px;background:#f2f0ff;color:#4c4861;font-size:12px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}.message-translation b{display:block;color:#6558d3;margin-bottom:4px}
+.toolbar{gap:18px}.toolbar .tabs{flex:none}.category-chips{height:100%;display:flex;align-items:center;gap:7px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none;padding:8px 2px}.category-chips::-webkit-scrollbar{display:none}.category-chip{flex:none;border:1px solid #e3e2ec;background:#fff;color:#666a78;border-radius:16px;padding:6px 10px;font-size:11px;white-space:nowrap;cursor:pointer}.category-chip:hover{border-color:#8b80df;color:#6558d3}.category-chip.active{border-color:#6558d3;background:#6558d3;color:#fff}.category-chip b{font-size:10px;margin-left:3px;opacity:.8}
+@media(max-width:1100px){.category-chips{max-width:42vw}.category-chip{padding:5px 8px}.toolbar{gap:10px}}
+.google-mailbox-row{width:100%;border:0;border-bottom:1px solid #eee;background:#fff;padding:10px 11px;display:flex;justify-content:space-between;align-items:center;text-align:left;cursor:pointer}.google-mailbox-row:last-child{border-bottom:0}.google-mailbox-row:hover{background:#f7f6fd}.google-mailbox-row span{min-width:0}.google-mailbox-row b,.google-mailbox-row small{display:block}.google-mailbox-row small{color:#7b8580;margin-top:3px;overflow:hidden;text-overflow:ellipsis}.google-mailbox-row em{font-style:normal;font-size:10px;color:#6558d3;background:#efedff;border-radius:10px;padding:4px 7px;white-space:nowrap}.empty-admin-list{padding:18px;text-align:center;color:#92969f;font-size:12px}

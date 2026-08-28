@@ -1,0 +1,12 @@
+.tag-dialog{width:min(760px,92vw)}
+.tag-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:16px}
+.tag-stat{border:1px solid #e7e7ee;border-radius:9px;padding:12px;display:grid;gap:5px}
+.tag-stat small,.mailbox-tag-row small{display:block;color:#858895;margin-top:3px}
+.tag-stat button{justify-self:start;margin-top:5px}
+.mailbox-tag-list{max-height:42vh;overflow:auto;border:1px solid #e7e7ee;border-radius:9px}
+.mailbox-tag-row{display:flex!important;align-items:center;justify-content:space-between;gap:14px;padding:10px 12px!important;border-bottom:1px solid #eeeeF3;margin:0!important}
+.mailbox-tag-row:last-child{border-bottom:0}.mailbox-tag-row span{min-width:0}.mailbox-tag-row b,.mailbox-tag-row small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mailbox-tag-row select{width:120px;flex:none;border:1px solid #dddfe7;border-radius:7px;padding:7px;background:#fff}
+.tag-ai-result{white-space:pre-wrap;line-height:1.65;background:#f7f6fc;border-radius:9px;margin-top:14px;padding:14px;color:#484955;max-height:30vh;overflow:auto}
+.tag-ai-result:empty{display:none}.nav-item small{display:block;color:#777a86;font-size:9px;margin-top:2px}.nav-item>span{min-width:0;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:650px){.tag-summary{grid-template-columns:1fr}}

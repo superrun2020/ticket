@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GeekForest · 用户工单系统</title><link rel="icon" href="/static/favicon.ico"><link rel="apple-touch-icon" href="/static/apple-touch-icon.png"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/overrides.css"><link rel="stylesheet" href="/static/settings.css"><link rel="stylesheet" href="/static/scrollfix.css"><link rel="stylesheet" href="/static/workspaces.css"><link rel="stylesheet" href="/static/tags.css"><link rel="stylesheet" href="/static/branding.css?v=20260828-14"><link rel="stylesheet" href="/static/translate-button.css?v=20260828-14">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><img class="brand-mark" src="/static/ticket-logo.png" alt=""><span>GeekForest</span></div><select id="workspaceSwitcher" class="workspace-switcher" aria-label="当前工作区"></select>
+    <nav>
+      <p class="nav-title">工作台</p>
+      <button class="nav-item active" data-status="all"><span>▣</span>所有工单 <b id="allCount">0</b></button>
+      <button class="nav-item" data-status="open"><span>◉</span>待处理 <b id="openCount">0</b></button>
+      <button class="nav-item" data-status="pending"><span>◷</span>等待客户 <b id="pendingCount">0</b></button>
+      <button class="nav-item" data-status="resolved"><span>✓</span>已解决 <b id="resolvedCount">0</b></button>
+      <button class="nav-item admin-entry" id="userAdminNav" hidden><span>♧</span>用户与工作区</button>
+      <button class="nav-item admin-entry" id="googleMailboxNav" hidden><span>G</span>Google 邮箱</button>
+      <p class="nav-title">邮箱标签</p><div id="tagNav"></div>
+      <p class="nav-title mailbox-title">邮箱</p><div id="mailboxNav"></div>
+    </nav>
+    <button class="profile" id="logoutButton" title="退出登录"><div class="avatar" id="profileAvatar">O</div><div><strong id="profileName">Oliver</strong><small id="profileRole">管理员</small></div><span>退出</span></button>
+  </aside>
+  <main>
+    <header><div><h1>所有工单</h1><p>集中处理每一个客户对话</p></div><div class="header-actions"><div class="mail-metrics"><span>待处理 <b id="unprocessedMetric">0</b></span><span>未读邮件 <b id="unreadMetric">0</b></span></div><label class="search">⌕ <input id="search" placeholder="搜索工单、客户…"></label><button class="icon-btn" id="mailboxTagsButton" title="邮箱标签管理">🏷</button><button class="icon-btn" id="aiSettingsButton" title="AI 设置">⚙</button><button class="icon-btn" id="userAdminButton" title="账户管理">♧</button></div></header>
+    <section class="toolbar"><div class="tabs"><button class="selected" data-view="all">全部</button><button data-view="mine">我的工单</button><button data-view="unassigned">未分配</button></div><div class="category-chips" id="categoryChips" aria-label="AI 分类"></div><div><select class="filter" id="sortFilter" aria-label="排序"><option value="latest">⇅ 最新动态</option><option value="oldest">⇅ 最早动态</option><option value="priority">↑ 优先级</option></select><select class="filter" id="priorityFilter" aria-label="优先级筛选"><option value="all">☷ 全部优先级</option><option value="urgent">紧急</option><option value="high">高优先级</option><option value="normal">普通</option></select></div></section>
+    <section class="workspace">
+      <div class="ticket-list" id="ticketList"><div class="loading">正在载入工单…</div></div>
+      <div class="ticket-detail" id="detail"><div class="empty"><span>✉</span><h2>选择一个工单</h2><p>在左侧选择工单后即可查看并回复客户。</p></div></div>
+    </section>
+  </main>
+  <div class="toast" id="toast"></div>
+  <dialog id="aiSettingsDialog" class="settings-dialog"><form method="dialog"><div class="settings-head"><div><small>GEEKFOREST AI</small><h2>AI 功能设置</h2></div><button value="cancel" class="dialog-close">×</button></div><label>服务商<select id="aiProvider"><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option></select></label><label>模型<input id="aiModel" placeholder="deepseek-chat"></label><label>API Key<input id="aiKey" type="password" autocomplete="off" placeholder="留空则保留现有 Key"><small id="keyState"></small></label><div id="aiSettingsStatus" class="settings-status"></div><div class="settings-actions"><button type="button" id="testAi" class="tool-button">测试连接</button><button type="button" id="saveAi" class="send">保存设置</button></div></form></dialog>
+  <dialog id="userAdminDialog" class="settings-dialog"><form method="dialog"><div class="settings-head"><div><small>ACCESS CONTROL</small><h2>账户与工作区</h2></div><button value="cancel" class="dialog-close">×</button></div><div id="userList" class="user-list"></div><h3>新增登录账户</h3><label>用户名<input id="newUsername" autocomplete="off"></label><label>显示名称<input id="newDisplayName" autocomplete="off"></label><label>初始密码<input id="newPassword" type="password" autocomplete="new-password" placeholder="至少 10 位"></label><div id="workspaceChecks" class="workspace-checks"></div><div id="userAdminStatus" class="settings-status"></div><div class="settings-actions"><button type="button" id="createUser" class="send">创建并分配</button></div></form></dialog>
+  <dialog id="googleMailboxDialog" class="settings-dialog"><form method="dialog"><div class="settings-head"><div><small>GOOGLE MAILBOX</small><h2>Google 邮箱管理</h2></div><button value="cancel" class="dialog-close">×</button></div><div id="googleMailboxList" class="user-list"></div><h3>新增或更新邮箱</h3><label>项目代号<input id="googleProjectCode" maxlength="120" placeholder="例如 G001"></label><label>Google 邮箱<input id="googleMailboxEmail" type="email" autocomplete="off" placeholder="name@gmail.com"></label><label>16 位应用专用密码<input id="googleAppPassword" type="password" autocomplete="new-password" maxlength="32" placeholder="更新时留空即保留原密码"><small>可含 Google 显示的空格，系统会自动去除。</small></label><label>邮箱标签<input id="googleMailboxTag" list="googleTagSuggestions" maxlength="40" placeholder="例如 产品邮箱"><datalist id="googleTagSuggestions"></datalist></label><div id="googleMailboxStatus" class="settings-status"></div><div class="settings-actions"><button type="button" id="saveGoogleMailbox" class="send">保存邮箱</button></div></form></dialog>
+  <dialog id="mailboxTagsDialog" class="settings-dialog tag-dialog"><form method="dialog"><div class="settings-head"><div><small>MAILBOX LABELS</small><h2>邮箱标签与汇总</h2></div><button value="cancel" class="dialog-close">×</button></div><div id="tagSummary" class="tag-summary"></div><div id="mailboxTagList" class="mailbox-tag-list"></div><div id="tagAiResult" class="tag-ai-result"></div></form></dialog>
+  <script src="/static/app.js?v=20260828-ai-category-learning-1"></script>
+</body></html>

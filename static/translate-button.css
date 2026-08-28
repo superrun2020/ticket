@@ -1,0 +1,29 @@
+.translate-ticket-button {
+  background: #6558d3 !important;
+  border-color: #6558d3 !important;
+  color: #fff !important;
+  font-size: 0 !important;
+  padding: 8px 12px !important;
+}
+.translate-ticket-button::after {
+  content: "🌐 翻译最新邮件";
+  font-size: 11px;
+}
+.translate-ticket-button:disabled { opacity: .65; }
+.google-mailbox-row::after {
+  content: "编辑";
+  flex: none;
+  margin-left: 8px;
+  border: 1px solid #d9d6ee;
+  border-radius: 6px;
+  padding: 5px 9px;
+  color: #6558d3;
+  background: #fff;
+  font-size: 11px;
+  font-style: normal;
+}
+.google-mailbox-row:hover::after {
+  color: #fff;
+  background: #6558d3;
+  border-color: #6558d3;
+}

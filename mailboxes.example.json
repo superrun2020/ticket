@@ -1,0 +1,15 @@
+[
+  {
+    "id": "project-a",
+    "name": "项目 A",
+    "email": "support@example.com",
+    "color": "#6558d3",
+    "imap_host": "imap.example.com",
+    "imap_port": 993,
+    "smtp_host": "smtp.example.com",
+    "smtp_port": 465,
+    "username": "support@example.com",
+    "password_env": "TICKET_MAIL_PROJECT_A_PASSWORD",
+    "smtp_ssl": true
+  }
+]
