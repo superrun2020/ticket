@@ -286,7 +286,13 @@ class MailWorker:
             # to reject it when that domain has no SPF/DKIM authorization for the
             # relay. Keep the project mailbox as Reply-To so customer replies still
             # return to the correct inbox.
-            sender_candidate = (os.getenv("TICKET_SMTP_FROM") or cfg.get("smtp_username") or cfg.get("username") or cfg["email"]).strip()
+            relay_enabled = os.getenv("TICKET_SMTP_RELAY_ENABLED", "0") == "1" and os.getenv("SYSTEM_MAIL_SMTP_HOST") and os.getenv("SYSTEM_MAIL_USER") and os.getenv("SYSTEM_MAIL_PASSWORD")
+            smtp_host = os.getenv("SYSTEM_MAIL_SMTP_HOST") if relay_enabled else cfg["smtp_host"]
+            smtp_port = int(os.getenv("SYSTEM_MAIL_SMTP_PORT", "465")) if relay_enabled else int(cfg.get("smtp_port", 465))
+            smtp_ssl = os.getenv("SYSTEM_MAIL_SMTP_SECURE", "true").lower() in {"1", "true", "yes", "ssl"} if relay_enabled else cfg.get("smtp_ssl", True)
+            smtp_user = os.getenv("SYSTEM_MAIL_USER") if relay_enabled else cfg.get("smtp_username", cfg.get("username", cfg["email"]))
+            smtp_password = os.getenv("SYSTEM_MAIL_PASSWORD") if relay_enabled else self._password(cfg)
+            sender_candidate = (os.getenv("TICKET_SMTP_FROM") or smtp_user or cfg.get("smtp_username") or cfg.get("username") or cfg["email"]).strip()
             sender = sender_candidate if "@" in sender_candidate else cfg["email"]
             msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, row["to_email"], row["subject"], formatdate(localtime=False), message_id
             if cfg["email"].lower() != sender.lower():
@@ -295,12 +301,12 @@ class MailWorker:
             if row["references_header"]: msg["References"] = row["references_header"]
             msg.set_content(row["body"])
             try:
-                if cfg.get("smtp_ssl", True):
-                    smtp = smtplib.SMTP_SSL(cfg["smtp_host"], int(cfg.get("smtp_port", 465)), context=ssl.create_default_context())
+                if smtp_ssl:
+                    smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ssl.create_default_context())
                 else:
-                    smtp = smtplib.SMTP(cfg["smtp_host"], int(cfg.get("smtp_port", 587))); smtp.starttls(context=ssl.create_default_context())
+                    smtp = smtplib.SMTP(smtp_host, smtp_port); smtp.starttls(context=ssl.create_default_context())
                 try:
-                    smtp.login(cfg.get("smtp_username", cfg.get("username", cfg["email"])), self._password(cfg)); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"]])
+                    smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"]])
                 finally: smtp.quit()
                 with self.db() as conn: conn.execute("UPDATE outbox SET status='sent',internet_message_id=?,last_error=NULL,updated_at=datetime('now') WHERE id=?", (message_id, row["id"]))
             except Exception as exc:
