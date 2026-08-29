@@ -281,7 +281,16 @@ class MailWorker:
             if not changed: continue
             message_id = row["internet_message_id"] or make_msgid(domain=cfg["email"].split("@")[-1])
             msg = EmailMessage()
-            msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = cfg["email"], row["to_email"], row["subject"], formatdate(localtime=False), message_id
+            # The authenticated SMTP identity must be used as the visible sender.
+            # Sending a project-domain From through a different relay causes Gmail
+            # to reject it when that domain has no SPF/DKIM authorization for the
+            # relay. Keep the project mailbox as Reply-To so customer replies still
+            # return to the correct inbox.
+            sender_candidate = (os.getenv("TICKET_SMTP_FROM") or cfg.get("smtp_username") or cfg.get("username") or cfg["email"]).strip()
+            sender = sender_candidate if "@" in sender_candidate else cfg["email"]
+            msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, row["to_email"], row["subject"], formatdate(localtime=False), message_id
+            if cfg["email"].lower() != sender.lower():
+                msg["Reply-To"] = cfg["email"]
             if row["in_reply_to"]: msg["In-Reply-To"] = row["in_reply_to"]
             if row["references_header"]: msg["References"] = row["references_header"]
             msg.set_content(row["body"])
@@ -291,7 +300,7 @@ class MailWorker:
                 else:
                     smtp = smtplib.SMTP(cfg["smtp_host"], int(cfg.get("smtp_port", 587))); smtp.starttls(context=ssl.create_default_context())
                 try:
-                    smtp.login(cfg.get("smtp_username", cfg.get("username", cfg["email"])), self._password(cfg)); smtp.send_message(msg)
+                    smtp.login(cfg.get("smtp_username", cfg.get("username", cfg["email"])), self._password(cfg)); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"]])
                 finally: smtp.quit()
                 with self.db() as conn: conn.execute("UPDATE outbox SET status='sent',internet_message_id=?,last_error=NULL,updated_at=datetime('now') WHERE id=?", (message_id, row["id"]))
             except Exception as exc:
