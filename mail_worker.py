@@ -286,13 +286,11 @@ class MailWorker:
             # to reject it when that domain has no SPF/DKIM authorization for the
             # relay. Keep the project mailbox as Reply-To so customer replies still
             # return to the correct inbox.
-            relay_enabled = os.getenv("TICKET_SMTP_RELAY_ENABLED", "0") == "1" and os.getenv("SYSTEM_MAIL_SMTP_HOST") and os.getenv("SYSTEM_MAIL_USER") and os.getenv("SYSTEM_MAIL_PASSWORD")
-            smtp_host = os.getenv("SYSTEM_MAIL_SMTP_HOST") if relay_enabled else cfg["smtp_host"]
-            smtp_port = int(os.getenv("SYSTEM_MAIL_SMTP_PORT", "465")) if relay_enabled else int(cfg.get("smtp_port", 465))
-            smtp_ssl = os.getenv("SYSTEM_MAIL_SMTP_SECURE", "true").lower() in {"1", "true", "yes", "ssl"} if relay_enabled else cfg.get("smtp_ssl", True)
-            smtp_user = os.getenv("SYSTEM_MAIL_USER") if relay_enabled else cfg.get("smtp_username", cfg.get("username", cfg["email"]))
-            smtp_password = os.getenv("SYSTEM_MAIL_PASSWORD") if relay_enabled else self._password(cfg)
-            sender_candidate = (os.getenv("TICKET_SMTP_FROM") or smtp_user or cfg.get("smtp_username") or cfg.get("username") or cfg["email"]).strip()
+            smtp_host, smtp_port = cfg["smtp_host"], int(cfg.get("smtp_port", 465))
+            smtp_ssl = cfg.get("smtp_ssl", True)
+            smtp_user = cfg.get("smtp_username", cfg.get("username", cfg["email"]))
+            smtp_password = self._password(cfg)
+            sender_candidate = (os.getenv("TICKET_SMTP_FROM") or smtp_user or cfg.get("username") or cfg["email"]).strip()
             sender = sender_candidate if "@" in sender_candidate else cfg["email"]
             msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, row["to_email"], row["subject"], formatdate(localtime=False), message_id
             if cfg["email"].lower() != sender.lower():
