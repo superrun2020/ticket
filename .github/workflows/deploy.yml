@@ -1,0 +1,60 @@
+name: Deploy ticket system
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Ticket system CI"]
+    types: [completed]
+
+concurrency:
+  group: ticket-system-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.TICKET_AUTO_DEPLOY == 'true' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TICKET_DEPLOY_SSH_KEY }}
+      - name: Trust deployment host
+        env:
+          DEPLOY_HOST: ${{ secrets.TICKET_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.TICKET_DEPLOY_PORT || '22' }}
+        run: ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+      - name: Back up production
+        env:
+          DEPLOY_HOST: ${{ secrets.TICKET_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.TICKET_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.TICKET_DEPLOY_PORT || '22' }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'set -eu; stamp=$(date +%Y%m%d-%H%M%S); target=/opt/ticket-system-backups/github-$stamp; mkdir -p "$target"; cp -a /opt/ticket-system/. "$target/app"; test ! -f /opt/ticket-system/data/tickets.db || cp /opt/ticket-system/data/tickets.db "$target/tickets.db"'
+      - name: Upload application
+        env:
+          DEPLOY_HOST: ${{ secrets.TICKET_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.TICKET_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.TICKET_DEPLOY_PORT || '22' }}
+        run: |
+          rsync -az --delete -e "ssh -p $DEPLOY_PORT" \
+            --exclude '.git/' --exclude '.github/' --exclude '.env' --exclude 'data/' \
+            --exclude 'mailboxes.json' --exclude '.venv/' --exclude '__pycache__/' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:/opt/ticket-system/"
+      - name: Verify and restart
+        env:
+          DEPLOY_HOST: ${{ secrets.TICKET_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.TICKET_DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.TICKET_DEPLOY_PORT || '22' }}
+        run: |
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'set -eu; cd /opt/ticket-system; .venv/bin/python -m py_compile app.py mail_worker.py; node --check static/app.js; sudo systemctl restart ticket-system; sudo systemctl is-active --quiet ticket-system'
