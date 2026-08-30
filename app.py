@@ -598,6 +598,13 @@ def translate(payload: AiTextIn):
     return {"ok": True, "text": ask_ai(prompt, payload.text), "target_language": payload.target_language, "target_label": label}
 
 
+@app.post("/api/ai/polish")
+def polish(payload: AiTextIn):
+    prompt = ("你是专业邮件编辑。请在不改变事实、数字、承诺和原意的前提下，润色下面的邮件正文；"
+              "调整为自然、清晰、专业、礼貌的商务邮件。只返回润色后的正文，不要解释修改过程，不要添加主题。")
+    return {"ok": True, "text": ask_ai(prompt, payload.text)}
+
+
 @app.get("/api/ai/settings")
 def ai_settings():
     config = get_ai_config()
