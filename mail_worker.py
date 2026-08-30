@@ -169,7 +169,7 @@ def _managed_stalwart_configs(root: Path) -> list[dict]:
         "imap_folder": "INBOX", "username": row["mailbox_email"], "smtp_username": row["mailbox_email"],
         "password": box.decrypt(row["password_ciphertext"].encode()).decode(), "smtp_host": host,
         "smtp_port": 465, "smtp_ssl": True, "workspace_id": row["workspace_id"],
-        "mailbox_tag": row["mailbox_tag"], "provider": "stalwart"} for row in rows]
+        "mailbox_tag": row["mailbox_tag"], "provider": "stalwart", "sync_existing_on_first_run": True} for row in rows]
 
 
 def load_configs(root: Path) -> list[dict]:
@@ -280,7 +280,7 @@ class MailWorker:
                 last_uid = row["last_uid"] if row else 0
                 backfill_active = bool(row["backfill_active"]) if row else False
                 backfill_target = row["backfill_target_uid"] if row else None
-            if last_uid == 0 and os.getenv("TICKET_MAIL_BACKFILL", "0") != "1":
+            if last_uid == 0 and os.getenv("TICKET_MAIL_BACKFILL", "0") != "1" and not cfg.get("sync_existing_on_first_run"):
                 typ, existing = client.uid("search", None, "ALL")
                 uids = existing[0].split() if typ == "OK" and existing else []
                 baseline = int(uids[-1]) if uids else 0

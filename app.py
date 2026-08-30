@@ -8,6 +8,9 @@ import logging
 import os
 import re
 import secrets
+import socket
+import ssl
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +18,7 @@ import urllib.parse
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, List, Optional
@@ -46,6 +50,8 @@ WORKSPACE_AI_CATEGORIES = {
 }
 INTERNAL_PROJECT_API_PREFIX = "/api/internal/projects"
 SYSTEM_SENDER_PREFIXES = ("mailer-daemon@", "postmaster@", "no-reply@", "noreply@", "bounce@", "do-not-reply@")
+mail_domain_status_cache: dict[str, tuple[float, str, dict]] = {}
+mail_tls_status_cache: tuple[float, bool] = (0.0, False)
 
 
 def internal_api_authorized(request: Request) -> bool:
@@ -475,6 +481,76 @@ def sync_stalwart_catalog() -> tuple[list[dict], list[dict]]:
     return domains, accounts
 
 
+def dns_short(name: str, record_type: str) -> list[str]:
+    try:
+        result = subprocess.run(["dig", "+time=3", "+tries=1", "+short", record_type, name],
+            capture_output=True, text=True, timeout=5, check=False)
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+
+def mail_tls_ready() -> bool:
+    global mail_tls_status_cache
+    cached_at, cached_value = mail_tls_status_cache
+    if time.time() - cached_at < 300:
+        return cached_value
+    context = ssl.create_default_context()
+    ready = True
+    for port in (993, 465):
+        try:
+            with socket.create_connection(("mail2.willech.com", port), timeout=5) as raw:
+                with context.wrap_socket(raw, server_hostname="mail2.willech.com") as secured:
+                    ready = ready and bool(secured.version())
+        except (OSError, ssl.SSLError):
+            ready = False
+    mail_tls_status_cache = (time.time(), ready)
+    return ready
+
+
+def domain_mail_status(domain: dict, tls_ready: bool) -> dict:
+    name = domain["name"]
+    zone = domain.get("dns_zone_file", "")
+    cache_key = hashlib.sha256(f"{domain['enabled']}:{zone}".encode()).hexdigest()
+    cached = mail_domain_status_cache.get(name)
+    if cached and time.time() - cached[0] < 300 and cached[1] == cache_key:
+        result = dict(cached[2])
+        result["checks"] = [dict(x) if x["id"] != "tls" else {**x, "passed": tls_ready,
+            "detail": "IMAP 与 SMTP TLS 均可用" if tls_ready else "Mail2 TLS 连接异常"} for x in result["checks"]]
+        result["passed_count"] = sum(1 for x in result["checks"] if x["passed"])
+        result["complete"] = result["passed_count"] == 6
+        return result
+    mx_records = dns_short(name, "MX")
+    txt_records = dns_short(name, "TXT")
+    dmarc_records = dns_short(f"_dmarc.{name}", "TXT")
+    selectors = list(dict.fromkeys(re.findall(r"(?im)^(\S+)\s+IN\s+TXT\s+.*?v=DKIM1", zone)))
+    selector_names = [selector.rstrip(".") if selector.endswith(f".{name}.") else selector.rstrip(".") for selector in selectors]
+    dkim_results = [dns_short(selector, "TXT") for selector in selector_names]
+    mx_ok = any("mail2.willech.com" in value.lower() for value in mx_records)
+    spf_values = [value.replace('" "', '').replace('"', '') for value in txt_records if "v=spf1" in value.lower()]
+    spf_ok = len(spf_values) == 1 and bool(re.search(r"(?:^|\s)[+?~-]?mx(?::|/|\s|$)", spf_values[0], re.I))
+    dkim_ok = len(selector_names) >= 2 and all(any("v=dkim1" in value.lower() for value in values) for values in dkim_results)
+    dmarc_ok = any("v=dmarc1" in value.lower() for value in dmarc_records)
+    checks = [
+        {"id": "bound", "name": "域名已绑定", "passed": bool(domain["enabled"]),
+            "detail": "Stalwart 域名已启用" if domain["enabled"] else "Stalwart 域名未启用"},
+        {"id": "mx", "name": "MX 收信路由", "passed": mx_ok,
+            "detail": "已指向 mail2.willech.com" if mx_ok else "MX 尚未指向 mail2.willech.com"},
+        {"id": "spf", "name": "SPF 发信授权", "passed": spf_ok,
+            "detail": "SPF 已授权 Mail2" if spf_ok else "SPF 尚未配置或未授权 MX"},
+        {"id": "dkim", "name": "DKIM 邮件签名", "passed": dkim_ok,
+            "detail": f"{len(selector_names)} 条 DKIM 均已生效" if dkim_ok else "需要配置 2 条 DKIM 记录"},
+        {"id": "dmarc", "name": "DMARC 反欺诈策略", "passed": dmarc_ok,
+            "detail": "DMARC 已生效" if dmarc_ok else "DMARC 尚未配置或未生效"},
+        {"id": "tls", "name": "安全收发连接", "passed": tls_ready,
+            "detail": "IMAP 与 SMTP TLS 均可用" if tls_ready else "Mail2 TLS 连接异常"},
+    ]
+    result = {"checks": checks, "passed_count": sum(1 for x in checks if x["passed"]),
+        "complete": all(x["passed"] for x in checks), "checked_at": now()}
+    mail_domain_status_cache[name] = (time.time(), cache_key, result)
+    return result
+
+
 def get_ai_config() -> dict:
     with db() as conn:
         values = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM app_settings WHERE key LIKE 'ai_%'")}
@@ -766,7 +842,7 @@ def mail_service_catalog(request: Request):
     except HTTPException as exc:
         live, warning = False, exc.detail.get("error") if isinstance(exc.detail, dict) else "MAIL_SERVICE_UNAVAILABLE"
     with db() as conn:
-        domains = [dict(x) for x in conn.execute("""SELECT id,name,description,enabled,synced_at
+        domains = [dict(x) for x in conn.execute("""SELECT id,name,description,enabled,dns_zone_file,synced_at
             FROM mail_service_domains ORDER BY name""")]
         accounts = [dict(x) for x in conn.execute("""SELECT a.id,a.email,a.display_name,a.domain_name,a.enabled,a.synced_at,
             CASE WHEN ms.account_id IS NOT NULL THEN 1 ELSE 0 END password_configured,
@@ -784,6 +860,18 @@ def mail_service_catalog(request: Request):
         counts[account["domain_name"]] = counts.get(account["domain_name"], 0) + 1
     for domain in domains:
         domain["mailbox_count"] = counts.get(domain["name"], 0)
+    tls_ready = mail_tls_ready()
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        statuses = list(executor.map(lambda item: domain_mail_status(item, tls_ready), domains))
+    readiness_by_domain = {}
+    for domain, readiness in zip(domains, statuses):
+        domain["readiness"] = readiness
+        domain.pop("dns_zone_file", None)
+        readiness_by_domain[domain["name"]] = readiness
+    for account in accounts:
+        readiness = readiness_by_domain.get(account["domain_name"], {"complete": False, "passed_count": 0})
+        account["domain_complete"] = readiness["complete"]
+        account["domain_passed_count"] = readiness["passed_count"]
     tag_suggestions = {w["id"]: list(mailbox_tags_for_workspace(w["id"])) for w in workspaces}
     return {"ok": True, "service": {"live": live, "warning": warning}, "domains": domains,
         "mailboxes": accounts, "workspaces": workspaces, "tag_suggestions": tag_suggestions}
@@ -793,6 +881,7 @@ def mail_service_catalog(request: Request):
 def sync_mail_service(request: Request):
     context = require_admin(request)
     domains, accounts = sync_stalwart_catalog()
+    mail_domain_status_cache.clear()
     logging.getLogger("ticket-audit").info("mail service synced actor=%s domains=%s mailboxes=%s ip=%s",
         context["username"], len(domains), len(accounts), request.client.host if request.client else "unknown")
     return {"ok": True, "domains": len(domains), "mailboxes": len(accounts), "synced_at": now()}
