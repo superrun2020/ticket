@@ -523,7 +523,24 @@ def domain_mail_status(domain: dict, tls_ready: bool) -> dict:
     mx_records = dns_short(name, "MX")
     txt_records = dns_short(name, "TXT")
     dmarc_records = dns_short(f"_dmarc.{name}", "TXT")
-    selectors = list(dict.fromkeys(re.findall(r"(?im)^(\S+)\s+IN\s+TXT\s+.*?v=DKIM1", zone)))
+    logical_lines, pending = [], ""
+    for raw_line in zone.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pending = f"{pending} {line}".strip()
+        if "(" in pending and ")" not in pending:
+            continue
+        logical_lines.append(pending)
+        pending = ""
+    if pending:
+        logical_lines.append(pending)
+    selectors = []
+    for line in logical_lines:
+        match = re.match(r"^(\S+)\s+IN\s+TXT\s+(.+)$", line, re.I)
+        if match and "v=dkim1" in match.group(2).lower():
+            selectors.append(match.group(1))
+    selectors = list(dict.fromkeys(selectors))
     selector_names = [selector.rstrip(".") if selector.endswith(f".{name}.") else selector.rstrip(".") for selector in selectors]
     dkim_results = [dns_short(selector, "TXT") for selector in selector_names]
     mx_ok = any("mail2.willech.com" in value.lower() for value in mx_records)
