@@ -753,6 +753,6 @@ def index():
 
 @app.get("/static/{filename}")
 def static(filename: str):
-    if filename not in {"app.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "translate-button.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
+    if filename not in {"app.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
         raise HTTPException(404)
     return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "no-cache, must-revalidate"})
