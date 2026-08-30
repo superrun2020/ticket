@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS managed_google_mailboxes (
   created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_managed_google_workspace ON managed_google_mailboxes(workspace_id, enabled);
+CREATE TABLE IF NOT EXISTS mail_service_domains (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1, dns_zone_file TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'stalwart', synced_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mail_service_accounts (
+  id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL DEFAULT '',
+  domain_name TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+  source TEXT NOT NULL DEFAULT 'stalwart', synced_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mail_service_accounts_domain ON mail_service_accounts(domain_name, enabled);
+CREATE TABLE IF NOT EXISTS managed_stalwart_mailboxes (
+  id TEXT PRIMARY KEY, account_id TEXT NOT NULL UNIQUE, mailbox_email TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL DEFAULT '', password_ciphertext TEXT NOT NULL,
+  mailbox_tag TEXT NOT NULL DEFAULT '未分类', workspace_id TEXT NOT NULL DEFAULT 'geekforest',
+  enabled INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_managed_stalwart_workspace ON managed_stalwart_mailboxes(workspace_id, enabled);
 CREATE TABLE IF NOT EXISTS workspaces (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );

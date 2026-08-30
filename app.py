@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import urllib.error
@@ -338,6 +339,11 @@ class WorkspaceSwitchIn(BaseModel):
     workspace_id: str = Field(min_length=1, max_length=100)
 
 
+class WorkspaceCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    slug: Optional[str] = Field(default=None, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+
+
 class MailboxTagIn(BaseModel):
     tag: str = Field(min_length=1, max_length=40)
 
@@ -356,8 +362,110 @@ class GoogleMailboxIn(BaseModel):
     mailbox_tag: str = Field(min_length=1, max_length=40)
 
 
+class MailServiceDomainIn(BaseModel):
+    name: str = Field(min_length=3, max_length=253)
+    description: str = Field(default="", max_length=255)
+
+
+class MailServiceMailboxIn(BaseModel):
+    domain: str = Field(min_length=3, max_length=253)
+    username: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(default="", max_length=255)
+    password: str = Field(min_length=8, max_length=500)
+    workspace_id: str = Field(default="geekforest", min_length=1, max_length=100)
+    mailbox_tag: str = Field(default="未分类", min_length=1, max_length=40)
+
+
 def secret_box() -> Fernet:
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(SESSION_SECRET.encode()).digest()))
+
+
+def require_admin(request: Request) -> dict:
+    context = current_context(request)
+    if not context["is_admin"]:
+        raise HTTPException(403, detail={"error": "ADMIN_REQUIRED"})
+    return context
+
+
+def normalize_mail_domain(value: str) -> str:
+    domain = value.strip().lower().rstrip(".")
+    if not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", domain):
+        raise HTTPException(422, detail={"error": "INVALID_DOMAIN"})
+    return domain
+
+
+def normalize_mailbox_username(value: str) -> str:
+    username = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9._+-]{0,62}[a-z0-9])?", username):
+        raise HTTPException(422, detail={"error": "INVALID_MAILBOX_USERNAME"})
+    return username
+
+
+def stalwart_jmap(method_calls: list, using: Optional[list[str]] = None) -> dict:
+    base_url = os.getenv("STALWART_API_BASE_URL", "https://mail2.willech.com").rstrip("/")
+    api_key = os.getenv("STALWART_API_KEY", "")
+    if not api_key:
+        raise HTTPException(503, detail={"error": "MAIL_SERVICE_NOT_CONFIGURED"})
+    body = {"using": using or ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"], "methodCalls": method_calls}
+    request = urllib.request.Request(
+        f"{base_url}/jmap/", data=json.dumps(body).encode(), method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=int(os.getenv("STALWART_API_TIMEOUT_SECONDS", "20"))) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        raise HTTPException(502, detail={"error": "MAIL_SERVICE_UNAVAILABLE"})
+    error = next((item for item in payload.get("methodResponses", []) if item[0] == "error"), None)
+    if error:
+        logging.getLogger("ticket-mail-admin").warning("Stalwart method failed type=%s", error[1].get("type", "unknown"))
+        raise HTTPException(502, detail={"error": "MAIL_SERVICE_REQUEST_FAILED"})
+    return payload
+
+
+def stalwart_result(payload: dict, call_id: str) -> dict:
+    return next((item[1] for item in payload.get("methodResponses", []) if item[2] == call_id), {})
+
+
+def stalwart_list(resource: str) -> list[dict]:
+    query_id, get_id = f"query{resource}", f"get{resource}"
+    payload = stalwart_jmap([
+        [f"x:{resource}/query", {}, query_id],
+        [f"x:{resource}/get", {"#ids": {"resultOf": query_id, "name": f"x:{resource}/query", "path": "/ids"}}, get_id],
+    ])
+    return stalwart_result(payload, get_id).get("list", [])
+
+
+def public_stalwart_domain(item: dict) -> dict:
+    return {"id": str(item.get("id", "")), "name": str(item.get("name", "")).lower(),
+        "description": str(item.get("description", "")), "enabled": item.get("isEnabled") is not False,
+        "dns_zone_file": str(item.get("dnsZoneFile", ""))}
+
+
+def public_stalwart_account(item: dict) -> dict:
+    email_address = str(item.get("emailAddress") or item.get("email") or item.get("address") or item.get("name") or "").lower()
+    return {"id": str(item.get("id", "")), "email": email_address,
+        "display_name": str(item.get("description") or item.get("displayName") or ""),
+        "enabled": item.get("isEnabled") is not False}
+
+
+def sync_stalwart_catalog() -> tuple[list[dict], list[dict]]:
+    domains = [public_stalwart_domain(x) for x in stalwart_list("Domain")]
+    accounts = [public_stalwart_account(x) for x in stalwart_list("Account")]
+    accounts = [x for x in accounts if "@" in x["email"]]
+    ts = now()
+    with db() as conn:
+        for domain in domains:
+            conn.execute("""INSERT INTO mail_service_domains(id,name,description,enabled,dns_zone_file,synced_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,
+                enabled=excluded.enabled,dns_zone_file=excluded.dns_zone_file,synced_at=excluded.synced_at""",
+                (domain["id"], domain["name"], domain["description"], int(domain["enabled"]), domain["dns_zone_file"], ts))
+        for account in accounts:
+            domain_name = account["email"].rsplit("@", 1)[1]
+            conn.execute("""INSERT INTO mail_service_accounts(id,email,display_name,domain_name,enabled,synced_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,display_name=excluded.display_name,
+                domain_name=excluded.domain_name,enabled=excluded.enabled,synced_at=excluded.synced_at""",
+                (account["id"], account["email"], account["display_name"], domain_name, int(account["enabled"]), ts))
+    return domains, accounts
 
 
 def get_ai_config() -> dict:
@@ -373,6 +481,22 @@ def get_ai_config() -> dict:
         except InvalidToken:
             logging.getLogger("ticket-ai").error("AI key cannot be decrypted")
     return {"provider": provider, "model": model, "api_key": key}
+
+
+def workspace_slug_from_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug[:48].strip("-") or f"workspace-{secrets.token_hex(3)}"
+
+
+def unique_workspace_slug(conn: sqlite3.Connection, preferred: str) -> str:
+    base = preferred[:48].strip("-") or f"workspace-{secrets.token_hex(3)}"
+    slug = base
+    index = 2
+    while conn.execute("SELECT 1 FROM workspaces WHERE slug=? OR id=?", (slug, slug)).fetchone():
+        suffix = f"-{index}"
+        slug = f"{base[:64 - len(suffix)]}{suffix}"
+        index += 1
+    return slug
 
 
 def ask_ai(instructions: str, text: str) -> str:
@@ -515,6 +639,26 @@ def list_users(request: Request):
     return {"ok": True, "users": users, "workspaces": workspaces}
 
 
+@app.post("/api/admin/workspaces")
+def create_workspace(payload: WorkspaceCreateIn, request: Request):
+    context = current_context(request)
+    if not context["is_admin"]:
+        raise HTTPException(403, detail={"error": "ADMIN_REQUIRED"})
+    workspace_name = payload.name.strip()
+    if not workspace_name:
+        raise HTTPException(422, detail={"error": "INVALID_WORKSPACE_NAME"})
+    ts = now()
+    requested_slug = payload.slug.strip("-") if payload.slug else workspace_slug_from_name(workspace_name)
+    with db() as conn:
+        if payload.slug and conn.execute("SELECT 1 FROM workspaces WHERE slug=? OR id=?", (requested_slug, requested_slug)).fetchone():
+            raise HTTPException(409, detail={"error": "WORKSPACE_EXISTS"})
+        workspace_id = unique_workspace_slug(conn, requested_slug)
+        conn.execute("INSERT INTO workspaces(id,name,slug,created_at,updated_at) VALUES(?,?,?,?,?)", (workspace_id, workspace_name, workspace_id, ts, ts))
+        conn.execute("INSERT OR IGNORE INTO workspace_memberships(user_id,workspace_id,role,created_at) VALUES(?,?,'admin',?)", (context["id"], workspace_id, ts))
+    logging.getLogger("ticket-audit").info("workspace created actor=%s workspace=%s name=%s ip=%s", context["username"], workspace_id, workspace_name, request.client.host if request.client else "unknown")
+    return {"ok": True, "workspace": {"id": workspace_id, "name": workspace_name, "slug": workspace_id}}
+
+
 @app.post("/api/admin/users")
 def create_user(payload: UserCreateIn, request: Request):
     context = current_context(request)
@@ -582,6 +726,102 @@ def save_google_mailbox(payload: GoogleMailboxIn, request: Request):
             raise HTTPException(409, detail={"error": "MAILBOX_EMAIL_ALREADY_EXISTS"})
     logging.getLogger("ticket-audit").info("google mailbox saved actor=%s mailbox_id=%s created=%s tag=%s ip=%s", context["username"], mailbox_id, created, payload.mailbox_tag, request.client.host if request.client else "unknown")
     return {"ok": True, "id": mailbox_id, "created": created, "password_configured": True}
+
+
+@app.get("/api/admin/mail-service")
+def mail_service_catalog(request: Request):
+    require_admin(request)
+    live, warning = True, None
+    try:
+        sync_stalwart_catalog()
+    except HTTPException as exc:
+        live, warning = False, exc.detail.get("error") if isinstance(exc.detail, dict) else "MAIL_SERVICE_UNAVAILABLE"
+    with db() as conn:
+        domains = [dict(x) for x in conn.execute("""SELECT id,name,description,enabled,synced_at
+            FROM mail_service_domains ORDER BY name""")]
+        accounts = [dict(x) for x in conn.execute("""SELECT a.id,a.email,a.display_name,a.domain_name,a.enabled,a.synced_at,
+            CASE WHEN ms.account_id IS NOT NULL THEN 1 ELSE 0 END password_configured,
+            CASE WHEN m.id IS NOT NULL AND m.enabled=1 THEN 1 ELSE 0 END ticket_connected,
+            COALESCE(ms.workspace_id,m.workspace_id,'') workspace_id,COALESCE(ms.mailbox_tag,m.mailbox_tag,'未分类') mailbox_tag,
+            s.updated_at sync_updated_at,s.last_backfill_at,
+            (SELECT COUNT(*) FROM tickets t WHERE t.mailbox_id=m.id) ticket_count,
+            (SELECT MAX(msg.created_at) FROM messages msg JOIN tickets t ON t.id=msg.ticket_id WHERE t.mailbox_id=m.id) last_message_at
+            FROM mail_service_accounts a LEFT JOIN managed_stalwart_mailboxes ms ON ms.account_id=a.id
+            LEFT JOIN mailboxes m ON lower(m.email)=lower(a.email) LEFT JOIN mailbox_sync s ON s.mailbox_id=m.id
+            ORDER BY a.email""")]
+        workspaces = [dict(x) for x in conn.execute("SELECT id,name FROM workspaces ORDER BY name")]
+    counts = {domain["name"]: 0 for domain in domains}
+    for account in accounts:
+        counts[account["domain_name"]] = counts.get(account["domain_name"], 0) + 1
+    for domain in domains:
+        domain["mailbox_count"] = counts.get(domain["name"], 0)
+    return {"ok": True, "service": {"live": live, "warning": warning}, "domains": domains,
+        "mailboxes": accounts, "workspaces": workspaces, "tag_suggestions": list(MAILBOX_TAGS)}
+
+
+@app.post("/api/admin/mail-service/sync")
+def sync_mail_service(request: Request):
+    context = require_admin(request)
+    domains, accounts = sync_stalwart_catalog()
+    logging.getLogger("ticket-audit").info("mail service synced actor=%s domains=%s mailboxes=%s ip=%s",
+        context["username"], len(domains), len(accounts), request.client.host if request.client else "unknown")
+    return {"ok": True, "domains": len(domains), "mailboxes": len(accounts), "synced_at": now()}
+
+
+@app.post("/api/admin/mail-service/domains")
+def create_mail_service_domain(payload: MailServiceDomainIn, request: Request):
+    context = require_admin(request)
+    domain = normalize_mail_domain(payload.name)
+    existing = next((x for x in stalwart_list("Domain") if str(x.get("name", "")).lower() == domain), None)
+    if existing:
+        raise HTTPException(409, detail={"error": "DOMAIN_EXISTS"})
+    result = stalwart_jmap([["x:Domain/set", {"create": {"new": {"name": domain,
+        "description": payload.description.strip(), "isEnabled": True}}}, "createDomain"]])
+    created = stalwart_result(result, "createDomain").get("created", {}).get("new")
+    if not created or not created.get("id"):
+        raise HTTPException(502, detail={"error": "DOMAIN_CREATE_FAILED"})
+    sync_stalwart_catalog()
+    logging.getLogger("ticket-audit").info("mail domain created actor=%s domain=%s id=%s ip=%s",
+        context["username"], domain, created["id"], request.client.host if request.client else "unknown")
+    return {"ok": True, "domain": {"id": str(created["id"]), "name": domain}}
+
+
+@app.post("/api/admin/mail-service/mailboxes")
+def create_mail_service_mailbox(payload: MailServiceMailboxIn, request: Request):
+    context = require_admin(request)
+    domain, username = normalize_mail_domain(payload.domain), normalize_mailbox_username(payload.username)
+    email_address = f"{username}@{domain}"
+    domains = stalwart_list("Domain")
+    domain_record = next((x for x in domains if str(x.get("name", "")).lower() == domain), None)
+    if not domain_record:
+        raise HTTPException(404, detail={"error": "DOMAIN_NOT_FOUND"})
+    if any(public_stalwart_account(x)["email"] == email_address for x in stalwart_list("Account")):
+        raise HTTPException(409, detail={"error": "MAILBOX_EXISTS"})
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM workspaces WHERE id=?", (payload.workspace_id,)).fetchone():
+            raise HTTPException(422, detail={"error": "INVALID_WORKSPACE"})
+    result = stalwart_jmap([["x:Account/set", {"create": {"new": {"@type": "User", "name": username,
+        "domainId": str(domain_record["id"]), "description": payload.display_name.strip(),
+        "credentials": {"0": {"@type": "Password", "secret": payload.password}}}}}, "createMailbox"]])
+    created = stalwart_result(result, "createMailbox").get("created", {}).get("new")
+    if not created or not created.get("id"):
+        raise HTTPException(502, detail={"error": "MAILBOX_CREATE_FAILED"})
+    account_id, mailbox_id, ts = str(created["id"]), f"stalwart-{created['id']}", now()
+    encrypted = secret_box().encrypt(payload.password.encode()).decode()
+    with db() as conn:
+        conn.execute("""INSERT INTO managed_stalwart_mailboxes
+            (id,account_id,mailbox_email,display_name,password_ciphertext,mailbox_tag,workspace_id,enabled,created_by,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,1,?,?,?)""", (mailbox_id, account_id, email_address, payload.display_name.strip(), encrypted,
+            payload.mailbox_tag, payload.workspace_id, context["username"], ts, ts))
+        conn.execute("""INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag)
+            VALUES(?,?,?,'#6558d3',?,1,?,?)""", (mailbox_id, payload.display_name.strip() or username, email_address,
+            ts, payload.workspace_id, payload.mailbox_tag))
+        conn.execute("INSERT INTO mailbox_sync(mailbox_id,last_uid,updated_at) VALUES(?,0,?)", (mailbox_id, ts))
+    sync_stalwart_catalog()
+    logging.getLogger("ticket-audit").info("mailbox created actor=%s mailbox=%s account=%s workspace=%s ip=%s",
+        context["username"], email_address, account_id, payload.workspace_id,
+        request.client.host if request.client else "unknown")
+    return {"ok": True, "mailbox": {"id": account_id, "email": email_address, "ticket_connected": True}}
 
 
 @app.post("/api/ai/translate")

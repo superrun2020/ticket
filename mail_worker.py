@@ -148,6 +148,30 @@ def _managed_google_configs(root: Path) -> list[dict]:
     return configs
 
 
+def _managed_stalwart_configs(root: Path) -> list[dict]:
+    path = root / "data" / "tickets.db"
+    if not path.exists():
+        return []
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(conn.execute("""SELECT id,display_name,mailbox_email,password_ciphertext,mailbox_tag,workspace_id
+            FROM managed_stalwart_mailboxes WHERE enabled=1"""))
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    key = base64.urlsafe_b64encode(hashlib.sha256(os.environ["TICKET_SESSION_SECRET"].encode()).digest())
+    box = Fernet(key)
+    host = os.getenv("STALWART_MAIL_HOST", "mail2.willech.com")
+    return [{"id": row["id"], "name": row["display_name"] or row["mailbox_email"].split("@", 1)[0],
+        "email": row["mailbox_email"], "color": "#6558d3", "imap_host": host, "imap_port": 993,
+        "imap_folder": "INBOX", "username": row["mailbox_email"], "smtp_username": row["mailbox_email"],
+        "password": box.decrypt(row["password_ciphertext"].encode()).decode(), "smtp_host": host,
+        "smtp_port": 465, "smtp_ssl": True, "workspace_id": row["workspace_id"],
+        "mailbox_tag": row["mailbox_tag"], "provider": "stalwart"} for row in rows]
+
+
 def load_configs(root: Path) -> list[dict]:
     if os.getenv("TICKET_MAILBOX_SOURCE") == "mysql":
         import pymysql
@@ -171,12 +195,12 @@ def load_configs(root: Path) -> list[dict]:
         finally:
             conn.close()
         configs = [_project_config(r) for r in rows]
-        return configs + _managed_google_configs(root) + _eddy_configs()
+        return configs + _managed_google_configs(root) + _managed_stalwart_configs(root) + _eddy_configs()
     path = Path(os.getenv("TICKET_MAILBOXES_FILE", root / "mailboxes.json"))
     if not path.exists():
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
-    return [x for x in data if x.get("enabled", True)] + _managed_google_configs(root) + _eddy_configs()
+    return [x for x in data if x.get("enabled", True)] + _managed_google_configs(root) + _managed_stalwart_configs(root) + _eddy_configs()
 
 
 class MailWorker:
