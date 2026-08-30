@@ -322,6 +322,8 @@ class MailWorker:
                 log.info("historical backfill started for %s through UID %s", cfg["id"], backfill_target)
             if backfill_active and row and row["last_backfill_at"]:
                 last_run = datetime.fromisoformat(row["last_backfill_at"].replace("Z", "+00:00"))
+                if last_run.tzinfo is None:
+                    last_run = last_run.replace(tzinfo=timezone.utc)
                 interval = int(os.getenv("TICKET_MAIL_BACKFILL_INTERVAL_SECONDS", "3600"))
                 if (datetime.now(timezone.utc) - last_run).total_seconds() < interval:
                     return
