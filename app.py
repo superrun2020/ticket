@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Iterator, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, EmailStr, Field
 from cryptography.fernet import Fernet, InvalidToken
 import pymysql
@@ -105,7 +106,7 @@ async def require_login(request: Request, call_next):
         if internal_api_authorized(request):
             return await call_next(request)
         return JSONResponse({"ok": False, "error": "INVALID_API_TOKEN"}, status_code=401)
-    if request.url.path in {"/login", "/api/auth/login"} or request.url.path.startswith("/static/"):
+    if request.url.path in {"/login", "/api/auth/login"} or request.url.path.startswith("/static/") or request.url.path.startswith("/api/email-events/open/"):
         return await call_next(request)
     if not valid_session(request.cookies.get("ticket_session")):
         if request.url.path.startswith("/api/"):
@@ -234,8 +235,8 @@ def init_db() -> None:
         # Additive migration for databases created by the early prototype.
         migrations = {
             "mailboxes": [("enabled", "INTEGER NOT NULL DEFAULT 1"), ("workspace_id", "TEXT NOT NULL DEFAULT 'geekforest'"), ("mailbox_tag", "TEXT NOT NULL DEFAULT '未分类'")],
-            "messages": [("provider_message_id", "TEXT"), ("internet_message_id", "TEXT"), ("references_header", "TEXT")],
-            "outbox": [("updated_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("internet_message_id", "TEXT"), ("in_reply_to", "TEXT"), ("references_header", "TEXT"), ("cc_emails", "TEXT"), ("bcc_emails", "TEXT")],
+            "messages": [("provider_message_id", "TEXT"), ("internet_message_id", "TEXT"), ("references_header", "TEXT"), ("delivery_status", "TEXT NOT NULL DEFAULT 'received'"), ("sent_at", "TEXT"), ("delivered_at", "TEXT"), ("opened_at", "TEXT"), ("failed_at", "TEXT"), ("open_count", "INTEGER NOT NULL DEFAULT 0"), ("delivery_error", "TEXT")],
+            "outbox": [("updated_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("internet_message_id", "TEXT"), ("in_reply_to", "TEXT"), ("references_header", "TEXT"), ("to_emails", "TEXT"), ("cc_emails", "TEXT"), ("bcc_emails", "TEXT"), ("message_id", "TEXT"), ("tracking_token", "TEXT"), ("delivered_at", "TEXT"), ("opened_at", "TEXT"), ("open_count", "INTEGER NOT NULL DEFAULT 0")],
             "mailbox_sync": [("backfill_active", "INTEGER NOT NULL DEFAULT 0"), ("backfill_target_uid", "INTEGER"), ("last_backfill_at", "TEXT")],
             "tickets": [("ai_category", "TEXT NOT NULL DEFAULT '待分类'"), ("ai_category_status", "TEXT NOT NULL DEFAULT 'pending'"), ("ai_category_confidence", "REAL"), ("ai_category_reason", "TEXT"), ("ai_category_source", "TEXT NOT NULL DEFAULT 'ai'"), ("ai_classified_at", "TEXT")],
         }
@@ -245,6 +246,7 @@ def init_db() -> None:
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_provider_id ON messages(provider_message_id) WHERE provider_message_id IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_tracking_token ON outbox(tracking_token) WHERE tracking_token IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_workspace ON mailboxes(workspace_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_ai_category ON tickets(ai_category, updated_at DESC)")
         conn.execute("""CREATE TABLE IF NOT EXISTS ai_category_feedback (
@@ -309,7 +311,7 @@ class ReplyIn(BaseModel):
 
 class ComposeMailIn(BaseModel):
     mailbox_id: str = Field(min_length=1, max_length=160)
-    to_email: EmailStr
+    to_email: str = Field(min_length=3, max_length=4000)
     cc: str = Field(default="", max_length=4000)
     bcc: str = Field(default="", max_length=4000)
     subject: str = Field(min_length=1, max_length=300)
@@ -797,11 +799,11 @@ def reply(ticket_id: str, payload: ReplyIn, request: Request):
         if not ticket:
             raise HTTPException(404, "Ticket not found")
         ts, message_id = now(), str(uuid.uuid4())
-        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read) VALUES(?,?,?,?,?,?,?,1)", (message_id, ticket_id, "outbound", "Oliver", ticket["mailbox_email"], payload.body, ts))
+        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status) VALUES(?,?,?,?,?,?,?,1,'queued')", (message_id, ticket_id, "outbound", context["display_name"], ticket["mailbox_email"], payload.body, ts))
         parent = conn.execute("SELECT internet_message_id,references_header FROM messages WHERE ticket_id=? AND direction='inbound' ORDER BY created_at DESC LIMIT 1", (ticket_id,)).fetchone()
         in_reply_to = parent["internet_message_id"] if parent else None
         references = ((parent["references_header"] or "") + " " + (in_reply_to or "")).strip() if parent else None
-        conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header) VALUES(?,?,?,?,?,'queued',?,?,?,?)", (str(uuid.uuid4()), ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", payload.body, ts, ts, in_reply_to, references))
+        conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header,message_id,tracking_token) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)", (str(uuid.uuid4()), ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", payload.body, ts, ts, in_reply_to, references, message_id, secrets.token_urlsafe(32)))
         conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if payload.close_after_send else "pending", ts, ticket_id))
     return {"ok": True, "message_id": message_id, "delivery": "queued"}
 
@@ -809,10 +811,9 @@ def reply(ticket_id: str, payload: ReplyIn, request: Request):
 @app.post("/api/tickets/compose")
 def compose_mail(payload: ComposeMailIn, request: Request):
     context = current_context(request)
-    recipient = str(payload.to_email).strip().lower()
     subject, body, ts = payload.subject.strip(), payload.body.strip(), now()
     def parse_recipients(raw: str) -> list[str]:
-        values = [part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()]
+        values = [part.strip().lower() for part in re.split(r"[,;\\n]+", raw) if part.strip()]
         result = []
         for value in values:
             try:
@@ -820,6 +821,10 @@ def compose_mail(payload: ComposeMailIn, request: Request):
             except Exception:
                 raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value})
         return list(dict.fromkeys(result))
+    recipients = parse_recipients(payload.to_email)
+    if not recipients:
+        raise HTTPException(422, detail={"error": "RECIPIENT_REQUIRED"})
+    recipient = recipients[0]
     cc_emails, bcc_emails = parse_recipients(payload.cc), parse_recipients(payload.bcc)
     if not subject or not body:
         raise HTTPException(422, detail={"error": "SUBJECT_AND_BODY_REQUIRED"})
@@ -837,13 +842,13 @@ def compose_mail(payload: ComposeMailIn, request: Request):
             VALUES(?,?,?,?,?,'pending','normal',?,'其他','classified','manual',?,?)""",
             (ticket_id, subject, customer_name, recipient, mailbox["id"], context["display_name"], ts, ts))
         conn.execute("""INSERT INTO messages
-            (id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read)
-            VALUES(?,?,?,?,?,?,?,1)""",
+            (id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status)
+            VALUES(?,?,?,?,?,?,?,1,'queued')""",
             (message_id, ticket_id, "outbound", context["display_name"], mailbox["email"], body, ts))
         conn.execute("""INSERT INTO outbox
-            (id,ticket_id,to_email,subject,body,status,created_at,updated_at,cc_emails,bcc_emails)
-            VALUES(?,?,?,?,?,'queued',?,?,?,?)""",
-            (str(uuid.uuid4()), ticket_id, recipient, f"[{ticket_id}] {subject}", body, ts, ts, ",".join(cc_emails), ",".join(bcc_emails)))
+            (id,ticket_id,to_email,subject,body,status,created_at,updated_at,to_emails,cc_emails,bcc_emails,message_id,tracking_token)
+            VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), ticket_id, recipient, f"[{ticket_id}] {subject}", body, ts, ts, ",".join(recipients), ",".join(cc_emails), ",".join(bcc_emails), message_id, secrets.token_urlsafe(32)))
     logging.getLogger("ticket-audit").info("outbound ticket composed actor=%s workspace=%s ticket=%s mailbox=%s recipient=%s ip=%s",
         context["username"], context["workspace_id"], ticket_id, payload.mailbox_id, recipient,
         request.client.host if request.client else "unknown")
@@ -917,6 +922,23 @@ def outbox():
     with db() as conn:
         rows = [row_dict(x) for x in conn.execute("SELECT * FROM outbox ORDER BY created_at DESC LIMIT 50")]
     return {"ok": True, "items": rows}
+
+
+TRACKING_PIXEL = base64.b64decode("R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=")
+
+
+@app.get("/api/email-events/open/{token}.gif")
+def email_open_event(token: str):
+    if len(token) < 32 or len(token) > 128:
+        raise HTTPException(404)
+    ts = now()
+    with db() as conn:
+        row = conn.execute("SELECT id,message_id FROM outbox WHERE tracking_token=?", (token,)).fetchone()
+        if row:
+            conn.execute("UPDATE outbox SET opened_at=COALESCE(opened_at,?),delivered_at=COALESCE(delivered_at,?),open_count=open_count+1 WHERE id=?", (ts, ts, row["id"]))
+            if row["message_id"]:
+                conn.execute("UPDATE messages SET delivery_status='read',opened_at=COALESCE(opened_at,?),delivered_at=COALESCE(delivered_at,?),open_count=open_count+1 WHERE id=? AND direction='outbound'", (ts, ts, row["message_id"]))
+    return Response(TRACKING_PIXEL, media_type="image/gif", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache"})
 
 
 @app.get("/")

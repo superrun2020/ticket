@@ -3,6 +3,7 @@ from __future__ import annotations
 import email
 import base64
 import hashlib
+import html
 import imaplib
 import json
 import logging
@@ -22,6 +23,23 @@ from cryptography.fernet import Fernet
 
 log = logging.getLogger("ticket-mail")
 TICKET_RE = re.compile(r"\[(TKT-\d+)\]", re.I)
+
+
+def _delivery_report(msg: email.message.Message) -> tuple[str, str, str] | None:
+    """Return (internet_message_id, status, detail) for a standards-based DSN."""
+    if msg.get_content_type() != "multipart/report" and "delivery status" not in (_decode(msg.get("Subject"))).lower():
+        return None
+    report = "\n".join(str(part) for part in msg.walk() if part.get_content_type() == "message/delivery-status")
+    if not report:
+        report = _body(msg)
+    original = re.search(r"(?:Original-Message-ID|X-Original-Message-ID):\s*(<[^>]+>)", report, re.I)
+    action = re.search(r"Action:\s*(delivered|relayed|expanded|failed|delayed)", report, re.I)
+    diagnostic = re.search(r"Diagnostic-Code:\s*([^\r\n]+)", report, re.I)
+    if not original or not action:
+        return None
+    value = action.group(1).lower()
+    status = "delivered" if value in {"delivered", "relayed", "expanded"} else "failed" if value == "failed" else "sent"
+    return original.group(1), status, (diagnostic.group(1).strip() if diagnostic else value)[:500]
 
 
 def _decode(value: str | None) -> str:
@@ -255,6 +273,24 @@ class MailWorker:
                 typ, fetched = client.uid("fetch", raw_uid, "(RFC822)")
                 if typ != "OK" or not fetched or not isinstance(fetched[0], tuple): continue
                 msg = email.message_from_bytes(fetched[0][1])
+                report = _delivery_report(msg)
+                if report:
+                    original_id, delivery_status, detail = report
+                    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    with self.db() as conn:
+                        row = conn.execute("SELECT id,message_id FROM outbox WHERE internet_message_id=?", (original_id,)).fetchone()
+                        if row:
+                            if delivery_status == "delivered":
+                                conn.execute("UPDATE outbox SET delivered_at=COALESCE(delivered_at,?),updated_at=? WHERE id=?", (ts, ts, row["id"]))
+                                if row["message_id"]:
+                                    conn.execute("UPDATE messages SET delivery_status='delivered',delivered_at=COALESCE(delivered_at,?) WHERE id=?", (ts, row["message_id"]))
+                            elif delivery_status == "failed":
+                                conn.execute("UPDATE outbox SET status='failed',last_error=?,updated_at=? WHERE id=?", (detail, ts, row["id"]))
+                                if row["message_id"]:
+                                    conn.execute("UPDATE messages SET delivery_status='failed',failed_at=?,delivery_error=? WHERE id=?", (ts, detail, row["message_id"]))
+                    with self.db() as conn:
+                        conn.execute("UPDATE mailbox_sync SET last_uid=?,updated_at=datetime('now') WHERE mailbox_id=?", (uid, cfg["id"]))
+                    continue
                 sender_name, sender_email = parseaddr(_decode(msg.get("From")))
                 subject = _decode(msg.get("Subject")) or "（无主题）"
                 match = TICKET_RE.search(subject)
@@ -282,6 +318,8 @@ class MailWorker:
         for row in rows:
             with self.db() as conn:
                 changed = conn.execute("UPDATE outbox SET status='sending',attempts=attempts+1,updated_at=datetime('now') WHERE id=? AND status IN ('queued','failed')", (row["id"],)).rowcount
+                if changed and row["message_id"]:
+                    conn.execute("UPDATE messages SET delivery_status='sending',delivery_error=NULL WHERE id=?", (row["message_id"],))
             if not changed: continue
             message_id = row["internet_message_id"] or make_msgid(domain=cfg["email"].split("@")[-1])
             msg = EmailMessage()
@@ -296,7 +334,8 @@ class MailWorker:
             smtp_password = self._password(cfg)
             sender_candidate = (os.getenv("TICKET_SMTP_FROM") or smtp_user or cfg.get("username") or cfg["email"]).strip()
             sender = sender_candidate if "@" in sender_candidate else cfg["email"]
-            msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, row["to_email"], row["subject"], formatdate(localtime=False), message_id
+            to_emails = [x.strip() for x in (row["to_emails"] or row["to_email"] or "").split(",") if x.strip()]
+            msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, ", ".join(to_emails), row["subject"], formatdate(localtime=False), message_id
             cc = [x.strip() for x in (row["cc_emails"] or "").split(",") if x.strip()]
             bcc = [x.strip() for x in (row["bcc_emails"] or "").split(",") if x.strip()]
             if cc: msg["Cc"] = ", ".join(cc)
@@ -305,15 +344,29 @@ class MailWorker:
             if row["in_reply_to"]: msg["In-Reply-To"] = row["in_reply_to"]
             if row["references_header"]: msg["References"] = row["references_header"]
             msg.set_content(row["body"])
+            if row["tracking_token"] and os.getenv("TICKET_EMAIL_OPEN_TRACKING", "1") == "1":
+                public_url = os.getenv("TICKET_PUBLIC_URL", "https://ticket.geekforest.ai").rstrip("/")
+                pixel = f'{public_url}/api/email-events/open/{row["tracking_token"]}.gif'
+                safe_body = html.escape(row["body"]).replace("\n", "<br>\n")
+                msg.add_alternative(f'<html><body><div>{safe_body}</div><img src="{pixel}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0"></body></html>', subtype="html")
             try:
                 if smtp_ssl:
                     smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ssl.create_default_context())
                 else:
                     smtp = smtplib.SMTP(smtp_host, smtp_port); smtp.starttls(context=ssl.create_default_context())
                 try:
-                    smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"], *cc, *bcc])
+                    smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[*to_emails, *cc, *bcc])
                 finally: smtp.quit()
-                with self.db() as conn: conn.execute("UPDATE outbox SET status='sent',internet_message_id=?,last_error=NULL,updated_at=datetime('now') WHERE id=?", (message_id, row["id"]))
+                sent_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                with self.db() as conn:
+                    conn.execute("UPDATE outbox SET status='sent',internet_message_id=?,last_error=NULL,updated_at=? WHERE id=?", (message_id, sent_at, row["id"]))
+                    if row["message_id"]:
+                        conn.execute("UPDATE messages SET delivery_status='sent',sent_at=?,internet_message_id=?,delivery_error=NULL WHERE id=?", (sent_at, message_id, row["message_id"]))
             except Exception as exc:
                 log.warning("send failed for %s: %s", row["id"], exc)
-                with self.db() as conn: conn.execute("UPDATE outbox SET status='failed',last_error=?,updated_at=datetime('now') WHERE id=?", (str(exc)[:500], row["id"]))
+                failed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                error_text = str(exc)[:500]
+                with self.db() as conn:
+                    conn.execute("UPDATE outbox SET status='failed',last_error=?,updated_at=? WHERE id=?", (error_text, failed_at, row["id"]))
+                    if row["message_id"]:
+                        conn.execute("UPDATE messages SET delivery_status='failed',failed_at=?,delivery_error=? WHERE id=?", (failed_at, error_text, row["message_id"]))
