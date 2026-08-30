@@ -341,7 +341,7 @@ class WorkspaceSwitchIn(BaseModel):
 
 class WorkspaceCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
-    slug: Optional[str] = Field(default=None, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    slug: Optional[str] = Field(default=None, max_length=120)
 
 
 class MailboxTagIn(BaseModel):
@@ -648,7 +648,7 @@ def create_workspace(payload: WorkspaceCreateIn, request: Request):
     if not workspace_name:
         raise HTTPException(422, detail={"error": "INVALID_WORKSPACE_NAME"})
     ts = now()
-    requested_slug = payload.slug.strip("-") if payload.slug else workspace_slug_from_name(workspace_name)
+    requested_slug = workspace_slug_from_name(payload.slug) if payload.slug and payload.slug.strip() else workspace_slug_from_name(workspace_name)
     with db() as conn:
         if payload.slug and conn.execute("SELECT 1 FROM workspaces WHERE slug=? OR id=?", (requested_slug, requested_slug)).fetchone():
             raise HTTPException(409, detail={"error": "WORKSPACE_EXISTS"})
