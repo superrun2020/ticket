@@ -73,6 +73,30 @@ def _body(msg: email.message.Message) -> str:
     return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", "replace").strip()
 
 
+def _attachments(msg: email.message.Message) -> list[dict]:
+    result = []
+    if not msg.is_multipart():
+        return result
+    max_count = int(os.getenv("TICKET_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
+    max_bytes = int(os.getenv("TICKET_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        disposition = (part.get("Content-Disposition") or "").lower()
+        if not filename and "attachment" not in disposition:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        if not payload or len(payload) > max_bytes:
+            continue
+        result.append({"filename": _decode(filename) if filename else "attachment",
+            "content_type": part.get_content_type() or "application/octet-stream",
+            "content_b64": base64.b64encode(payload).decode()})
+        if len(result) >= max_count:
+            break
+    return result
+
+
 def _eddy_configs() -> list[dict]:
     if os.getenv("EDDY_SOURCE_ENABLED", "0") != "1" or not os.getenv("EDDY_SOURCE_DB_HOST"):
         return []
@@ -352,7 +376,7 @@ class MailWorker:
                     with self.db() as conn:
                         conn.execute("UPDATE mailbox_sync SET last_uid=?,updated_at=datetime('now') WHERE mailbox_id=?", (uid, cfg["id"]))
                     continue
-                self.receive(IncomingMail(mailbox_id=cfg["id"], sender_name=(sender_name or sender_email)[:120], sender_email=sender_email, subject=subject[:300], body=(_body(msg) or "（无正文）")[:20_000], in_reply_to_ticket=match.group(1).upper() if match else None, provider_message_id=f"{cfg['id']}:{uid}", internet_message_id=(msg.get("Message-ID") or "")[:1000] or None, references_header=((msg.get("References") or msg.get("In-Reply-To") or "")[:4000] or None), historical=backfill_active))
+                self.receive(IncomingMail(mailbox_id=cfg["id"], sender_name=(sender_name or sender_email)[:120], sender_email=sender_email, subject=subject[:300], body=(_body(msg) or "（无正文）")[:20_000], in_reply_to_ticket=match.group(1).upper() if match else None, provider_message_id=f"{cfg['id']}:{uid}", internet_message_id=(msg.get("Message-ID") or "")[:1000] or None, references_header=((msg.get("References") or msg.get("In-Reply-To") or "")[:4000] or None), historical=backfill_active, attachments=_attachments(msg)))
                 with self.db() as conn:
                     conn.execute("UPDATE mailbox_sync SET last_uid=?,updated_at=datetime('now') WHERE mailbox_id=?", (uid, cfg["id"]))
             if backfill_active:
@@ -406,6 +430,17 @@ class MailWorker:
                 pixel = f'{public_url}/api/email-events/open/{row["tracking_token"]}.gif'
                 safe_body = html.escape(row["body"]).replace("\n", "<br>\n")
                 msg.add_alternative(f'<html><body><div>{safe_body}</div><img src="{pixel}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0"></body></html>', subtype="html")
+            with self.db() as conn:
+                attachments = list(conn.execute("SELECT filename,content_type,storage_path FROM attachments WHERE outbox_id=? ORDER BY created_at,id", (row["id"],)))
+            for attachment in attachments:
+                path = self.root / attachment["storage_path"]
+                if not path.is_file():
+                    log.warning("skip missing attachment for outbox %s: %s", row["id"], attachment["filename"])
+                    continue
+                maintype, _, subtype = (attachment["content_type"] or "application/octet-stream").partition("/")
+                if not subtype:
+                    maintype, subtype = "application", "octet-stream"
+                msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=attachment["filename"])
             try:
                 if smtp_ssl:
                     smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ssl.create_default_context())

@@ -26,11 +26,21 @@ CREATE TABLE IF NOT EXISTS messages (
   open_count INTEGER NOT NULL DEFAULT 0, delivery_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ticket_time ON messages(ticket_id, created_at);
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY, message_id TEXT REFERENCES messages(id), outbox_id TEXT REFERENCES outbox(id),
+  ticket_id TEXT NOT NULL REFERENCES tickets(id), direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
+  filename TEXT NOT NULL, content_type TEXT NOT NULL, size INTEGER NOT NULL,
+  storage_path TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_outbox ON attachments(outbox_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON attachments(ticket_id, created_at);
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), to_email TEXT NOT NULL,
   subject TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed')),
   created_at TEXT NOT NULL, updated_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
   internet_message_id TEXT, in_reply_to TEXT, references_header TEXT, message_id TEXT,
+  to_emails TEXT, cc_emails TEXT, bcc_emails TEXT,
   tracking_token TEXT, delivered_at TEXT, opened_at TEXT, open_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);

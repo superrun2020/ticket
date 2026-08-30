@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, EmailStr, Field
 from cryptography.fernet import Fernet, InvalidToken
@@ -32,6 +32,9 @@ import pymysql
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "tickets.db"
+ATTACHMENT_DIR = ROOT / "data" / "attachments"
+MAX_ATTACHMENT_BYTES = int(os.getenv("TICKET_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
+MAX_ATTACHMENTS_PER_MESSAGE = int(os.getenv("TICKET_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
 app = FastAPI(title="PostPilot Ticket Desk")
 worker = None
 LOGIN_USER = os.getenv("TICKET_LOGIN_USER", "admin")
@@ -263,6 +266,14 @@ def init_db() -> None:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_tracking_token ON outbox(tracking_token) WHERE tracking_token IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_workspace ON mailboxes(workspace_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_ai_category ON tickets(ai_category, updated_at DESC)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY, message_id TEXT REFERENCES messages(id), outbox_id TEXT REFERENCES outbox(id),
+            ticket_id TEXT NOT NULL REFERENCES tickets(id), direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
+            filename TEXT NOT NULL, content_type TEXT NOT NULL, size INTEGER NOT NULL,
+            storage_path TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_outbox ON attachments(outbox_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON attachments(ticket_id, created_at)")
         conn.execute("""CREATE TABLE IF NOT EXISTS ai_category_feedback (
             id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), workspace_id TEXT NOT NULL,
             previous_category TEXT NOT NULL, corrected_category TEXT NOT NULL,
@@ -330,6 +341,12 @@ class ComposeMailIn(BaseModel):
     bcc: str = Field(default="", max_length=4000)
     subject: str = Field(min_length=1, max_length=300)
     body: str = Field(min_length=1, max_length=20_000)
+
+
+class IncomingAttachment(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(default="application/octet-stream", max_length=120)
+    content_b64: str = Field(min_length=1)
 
 
 class LoginIn(BaseModel):
@@ -894,6 +911,71 @@ def mail_service_catalog(request: Request):
         "mailboxes": accounts, "workspaces": workspaces, "tag_suggestions": tag_suggestions}
 
 
+def mailbox_runtime_configs() -> dict[str, dict]:
+    try:
+        from mail_worker import load_configs
+        return {cfg["id"]: cfg for cfg in load_configs(ROOT)}
+    except Exception:
+        logging.getLogger("ticket-mail-admin").warning("runtime mailbox config load failed", exc_info=True)
+        return {}
+
+
+def public_mailbox_config(mailbox: dict, cfg: Optional[dict] = None) -> dict:
+    email_address = mailbox["email"]
+    domain_host = email_address.rsplit("@", 1)[1] if "@" in email_address else ""
+    return {
+        "imap_host": (cfg or {}).get("imap_host") or ("imap.gmail.com" if (cfg or {}).get("provider") == "google" else os.getenv("STALWART_MAIL_HOST", "mail2.willech.com") if str(mailbox["id"]).startswith("managed-stalwart-") else domain_host),
+        "imap_port": int((cfg or {}).get("imap_port") or 993),
+        "imap_ssl": True,
+        "imap_folder": (cfg or {}).get("imap_folder") or "INBOX",
+        "imap_username": (cfg or {}).get("username") or email_address,
+        "smtp_host": (cfg or {}).get("smtp_host") or ("smtp.gmail.com" if (cfg or {}).get("provider") == "google" else os.getenv("STALWART_MAIL_HOST", "mail2.willech.com") if str(mailbox["id"]).startswith("managed-stalwart-") else domain_host),
+        "smtp_port": int((cfg or {}).get("smtp_port") or 465),
+        "smtp_ssl": bool((cfg or {}).get("smtp_ssl", True)),
+        "smtp_username": (cfg or {}).get("smtp_username") or (cfg or {}).get("username") or email_address,
+    }
+
+
+@app.get("/api/admin/mailboxes")
+def admin_mailboxes(request: Request):
+    require_admin(request)
+    configs = mailbox_runtime_configs()
+    with db() as conn:
+        rows = [row_dict(x) for x in conn.execute("""SELECT m.*,w.name workspace_name,
+            COUNT(DISTINCT t.id) ticket_count,
+            COUNT(DISTINCT CASE WHEN msg.direction='inbound' AND msg.is_read=0 THEN msg.id END) unread_count,
+            MAX(msg.created_at) latest_message_at
+            FROM mailboxes m LEFT JOIN workspaces w ON w.id=m.workspace_id
+            LEFT JOIN tickets t ON t.mailbox_id=m.id LEFT JOIN messages msg ON msg.ticket_id=t.id
+            GROUP BY m.id ORDER BY w.name,m.email""")]
+    mailboxes = []
+    for row in rows:
+        cfg = configs.get(row["id"])
+        item = dict(row)
+        item["provider"] = (cfg or {}).get("provider") or ("google" if str(row["id"]).startswith("managed-google-") else "stalwart" if str(row["id"]).startswith("managed-stalwart-") else "standard")
+        item["config"] = public_mailbox_config(row, cfg)
+        item["password_available"] = bool((cfg or {}).get("password"))
+        mailboxes.append(item)
+    return {"ok": True, "mailboxes": mailboxes}
+
+
+@app.post("/api/admin/mailboxes/{mailbox_id}/secret")
+def admin_mailbox_secret(mailbox_id: str, request: Request):
+    context = require_admin(request)
+    configs = mailbox_runtime_configs()
+    cfg = configs.get(mailbox_id)
+    with db() as conn:
+        mailbox = conn.execute("SELECT * FROM mailboxes WHERE id=?", (mailbox_id,)).fetchone()
+    if not mailbox:
+        raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
+    password = (cfg or {}).get("password")
+    if not password:
+        raise HTTPException(404, detail={"error": "MAILBOX_PASSWORD_NOT_AVAILABLE"})
+    logging.getLogger("ticket-audit").info("mailbox secret accessed actor=%s mailbox=%s workspace=%s ip=%s",
+        context["username"], mailbox_id, mailbox["workspace_id"], request.client.host if request.client else "unknown")
+    return {"ok": True, "email": mailbox["email"], "password": password, "config": public_mailbox_config(dict(mailbox), cfg)}
+
+
 @app.post("/api/admin/mail-service/sync")
 def sync_mail_service(request: Request):
     context = require_admin(request)
@@ -1059,10 +1141,68 @@ class IncomingMail(BaseModel):
     internet_message_id: Optional[str] = Field(default=None, max_length=1000)
     references_header: Optional[str] = Field(default=None, max_length=4000)
     historical: bool = False
+    attachments: list[IncomingAttachment] = Field(default_factory=list)
 
 
 def row_dict(row: sqlite3.Row) -> dict:
     return dict(row)
+
+
+def safe_attachment_filename(filename: str) -> str:
+    name = Path(filename or "attachment").name.strip().replace("\x00", "")
+    name = re.sub(r"[^\w.\-()\[\]\u4e00-\u9fff ]+", "_", name, flags=re.UNICODE).strip(" .")
+    return (name[:180] or "attachment")
+
+
+def save_attachment_bytes(conn: sqlite3.Connection, *, ticket_id: str, message_id: str, outbox_id: Optional[str],
+                          direction: str, filename: str, content_type: str, data: bytes, created_at: str) -> dict:
+    if not data:
+        raise HTTPException(422, detail={"error": "EMPTY_ATTACHMENT"})
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(413, detail={"error": "ATTACHMENT_TOO_LARGE", "filename": filename})
+    attachment_id = str(uuid.uuid4())
+    safe_name = safe_attachment_filename(filename)
+    folder = ATTACHMENT_DIR / created_at[:7].replace("-", "/")
+    folder.mkdir(parents=True, exist_ok=True)
+    storage_path = folder / f"{attachment_id}-{safe_name}"
+    storage_path.write_bytes(data)
+    relative_path = str(storage_path.relative_to(ROOT))
+    row = {"id": attachment_id, "message_id": message_id, "outbox_id": outbox_id, "ticket_id": ticket_id,
+           "direction": direction, "filename": safe_name, "content_type": content_type or "application/octet-stream",
+           "size": len(data), "storage_path": relative_path, "created_at": created_at}
+    conn.execute("""INSERT INTO attachments
+        (id,message_id,outbox_id,ticket_id,direction,filename,content_type,size,storage_path,created_at)
+        VALUES(:id,:message_id,:outbox_id,:ticket_id,:direction,:filename,:content_type,:size,:storage_path,:created_at)""", row)
+    return {k: row[k] for k in ("id", "filename", "content_type", "size", "created_at")}
+
+
+async def save_uploads(conn: sqlite3.Connection, *, ticket_id: str, message_id: str, outbox_id: Optional[str],
+                       direction: str, files: list[UploadFile], created_at: str) -> list[dict]:
+    result = []
+    actual_files = [f for f in files if f and f.filename]
+    if len(actual_files) > MAX_ATTACHMENTS_PER_MESSAGE:
+        raise HTTPException(413, detail={"error": "TOO_MANY_ATTACHMENTS"})
+    for upload in actual_files:
+        data = await upload.read()
+        result.append(save_attachment_bytes(conn, ticket_id=ticket_id, message_id=message_id, outbox_id=outbox_id,
+            direction=direction, filename=upload.filename or "attachment",
+            content_type=upload.content_type or "application/octet-stream", data=data, created_at=created_at))
+    return result
+
+
+def attach_message_files(conn: sqlite3.Connection, messages: list[dict]) -> list[dict]:
+    if not messages:
+        return messages
+    ids = [m["id"] for m in messages]
+    placeholders = ",".join("?" for _ in ids)
+    files = [row_dict(x) for x in conn.execute(
+        f"SELECT id,message_id,filename,content_type,size,created_at FROM attachments WHERE message_id IN ({placeholders}) ORDER BY created_at,id", ids)]
+    by_message: dict[str, list[dict]] = {}
+    for item in files:
+        by_message.setdefault(item["message_id"], []).append({k: item[k] for k in ("id", "filename", "content_type", "size", "created_at")})
+    for message in messages:
+        message["attachments"] = by_message.get(message["id"], [])
+    return messages
 
 
 @app.get("/api/tickets")
@@ -1168,8 +1308,23 @@ def get_ticket(ticket_id: str, request: Request):
         if not row:
             raise HTTPException(404, "Ticket not found")
         conn.execute("UPDATE messages SET is_read=1 WHERE ticket_id=? AND direction='inbound'", (ticket_id,))
-        messages = [row_dict(x) for x in conn.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY created_at", (ticket_id,))]
+        messages = attach_message_files(conn, [row_dict(x) for x in conn.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY created_at", (ticket_id,))])
     return {"ok": True, "ticket": row_dict(row), "messages": messages}
+
+
+@app.get("/api/attachments/{attachment_id}")
+def download_attachment(attachment_id: str, request: Request):
+    context = current_context(request)
+    with db() as conn:
+        row = conn.execute("""SELECT a.* FROM attachments a
+            JOIN tickets t ON t.id=a.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
+            WHERE a.id=? AND m.workspace_id=?""", (attachment_id, context["workspace_id"])).fetchone()
+    if not row:
+        raise HTTPException(404, detail={"error": "ATTACHMENT_NOT_FOUND"})
+    path = (ROOT / row["storage_path"]).resolve()
+    if not path.is_file() or ROOT.resolve() not in path.parents:
+        raise HTTPException(404, detail={"error": "ATTACHMENT_FILE_MISSING"})
+    return FileResponse(path, media_type=row["content_type"], filename=row["filename"])
 
 
 @app.post("/api/tickets/{ticket_id}/reply")
@@ -1187,6 +1342,29 @@ def reply(ticket_id: str, payload: ReplyIn, request: Request):
         conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header,message_id,tracking_token) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)", (str(uuid.uuid4()), ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", payload.body, ts, ts, in_reply_to, references, message_id, secrets.token_urlsafe(32)))
         conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if payload.close_after_send else "pending", ts, ticket_id))
     return {"ok": True, "message_id": message_id, "delivery": "queued"}
+
+
+@app.post("/api/tickets/{ticket_id}/reply-with-attachments")
+async def reply_with_attachments(ticket_id: str, request: Request, body: str = Form(...),
+                                 close_after_send: bool = Form(False), files: list[UploadFile] = File(default=[])):
+    context = current_context(request)
+    clean_body = body.strip()
+    if not clean_body:
+        raise HTTPException(422, detail={"error": "BODY_REQUIRED"})
+    with db() as conn:
+        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
+        if not ticket:
+            raise HTTPException(404, "Ticket not found")
+        ts, message_id, outbox_id = now(), str(uuid.uuid4()), str(uuid.uuid4())
+        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status) VALUES(?,?,?,?,?,?,?,1,'queued')", (message_id, ticket_id, "outbound", context["display_name"], ticket["mailbox_email"], clean_body, ts))
+        parent = conn.execute("SELECT internet_message_id,references_header FROM messages WHERE ticket_id=? AND direction='inbound' ORDER BY created_at DESC LIMIT 1", (ticket_id,)).fetchone()
+        in_reply_to = parent["internet_message_id"] if parent else None
+        references = ((parent["references_header"] or "") + " " + (in_reply_to or "")).strip() if parent else None
+        conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header,message_id,tracking_token) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)", (outbox_id, ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", clean_body, ts, ts, in_reply_to, references, message_id, secrets.token_urlsafe(32)))
+        attachments = await save_uploads(conn, ticket_id=ticket_id, message_id=message_id, outbox_id=outbox_id,
+            direction="outbound", files=files, created_at=ts)
+        conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if close_after_send else "pending", ts, ticket_id))
+    return {"ok": True, "message_id": message_id, "delivery": "queued", "attachments": attachments}
 
 
 @app.post("/api/tickets/compose")
@@ -1234,6 +1412,57 @@ def compose_mail(payload: ComposeMailIn, request: Request):
         context["username"], context["workspace_id"], ticket_id, payload.mailbox_id, recipient,
         request.client.host if request.client else "unknown")
     return {"ok": True, "ticket_id": ticket_id, "delivery": "queued"}
+
+
+@app.post("/api/tickets/compose-with-attachments")
+async def compose_mail_with_attachments(request: Request, mailbox_id: str = Form(...), to_email: str = Form(...),
+                                        cc: str = Form(""), bcc: str = Form(""), subject: str = Form(...),
+                                        body: str = Form(...), files: list[UploadFile] = File(default=[])):
+    context = current_context(request)
+    subject, body, ts = subject.strip(), body.strip(), now()
+    def parse_recipients(raw: str) -> list[str]:
+        values = [part.strip().lower() for part in re.split(r"[,;\\n]+", raw) if part.strip()]
+        result = []
+        for value in values:
+            try:
+                result.append(str(EmailStr(value)))
+            except Exception:
+                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value})
+        return list(dict.fromkeys(result))
+    recipients = parse_recipients(to_email)
+    if not recipients:
+        raise HTTPException(422, detail={"error": "RECIPIENT_REQUIRED"})
+    recipient = recipients[0]
+    cc_emails, bcc_emails = parse_recipients(cc), parse_recipients(bcc)
+    if not subject or not body:
+        raise HTTPException(422, detail={"error": "SUBJECT_AND_BODY_REQUIRED"})
+    with db() as conn:
+        mailbox = conn.execute("SELECT id,name,email FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1",
+            (mailbox_id, context["workspace_id"])).fetchone()
+        if not mailbox:
+            raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
+        sequence = conn.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id,5) AS INTEGER)),1048)+1 FROM tickets").fetchone()[0]
+        ticket_id, message_id, outbox_id = f"TKT-{sequence}", str(uuid.uuid4()), str(uuid.uuid4())
+        customer_name = recipient.split("@", 1)[0][:120]
+        conn.execute("""INSERT INTO tickets
+            (id,subject,customer_name,customer_email,mailbox_id,status,priority,assignee,ai_category,
+             ai_category_status,ai_category_source,created_at,updated_at)
+            VALUES(?,?,?,?,?,'pending','normal',?,'其他','classified','manual',?,?)""",
+            (ticket_id, subject, customer_name, recipient, mailbox["id"], context["display_name"], ts, ts))
+        conn.execute("""INSERT INTO messages
+            (id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status)
+            VALUES(?,?,?,?,?,?,?,1,'queued')""",
+            (message_id, ticket_id, "outbound", context["display_name"], mailbox["email"], body, ts))
+        conn.execute("""INSERT INTO outbox
+            (id,ticket_id,to_email,subject,body,status,created_at,updated_at,to_emails,cc_emails,bcc_emails,message_id,tracking_token)
+            VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?)""",
+            (outbox_id, ticket_id, recipient, f"[{ticket_id}] {subject}", body, ts, ts, ",".join(recipients), ",".join(cc_emails), ",".join(bcc_emails), message_id, secrets.token_urlsafe(32)))
+        attachments = await save_uploads(conn, ticket_id=ticket_id, message_id=message_id, outbox_id=outbox_id,
+            direction="outbound", files=files, created_at=ts)
+    logging.getLogger("ticket-audit").info("outbound ticket composed actor=%s workspace=%s ticket=%s mailbox=%s recipient=%s attachments=%s ip=%s",
+        context["username"], context["workspace_id"], ticket_id, mailbox_id, recipient, len(attachments),
+        request.client.host if request.client else "unknown")
+    return {"ok": True, "ticket_id": ticket_id, "delivery": "queued", "attachments": attachments}
 
 
 @app.patch("/api/tickets/{ticket_id}")
@@ -1291,7 +1520,15 @@ def receive_mail(mail: IncomingMail):
             sequence = conn.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id,5) AS INTEGER)),1048)+1 FROM tickets").fetchone()[0]
             ticket_id = f"TKT-{sequence}"
             conn.execute("INSERT INTO tickets(id,subject,customer_name,customer_email,mailbox_id,status,priority,assignee,created_at,updated_at) VALUES(?,?,?,?,?,'open','normal','未分配',?,?)", (ticket_id, mail.subject, mail.sender_name, str(mail.sender_email), mail.mailbox_id, ts, ts))
-        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,provider_message_id,internet_message_id,references_header) VALUES(?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), ticket_id, "inbound", mail.sender_name, str(mail.sender_email), mail.body, ts, mail.provider_message_id, mail.internet_message_id, mail.references_header))
+        message_id = str(uuid.uuid4())
+        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,provider_message_id,internet_message_id,references_header) VALUES(?,?,?,?,?,?,?,?,?,?)", (message_id, ticket_id, "inbound", mail.sender_name, str(mail.sender_email), mail.body, ts, mail.provider_message_id, mail.internet_message_id, mail.references_header))
+        for item in mail.attachments[:MAX_ATTACHMENTS_PER_MESSAGE]:
+            try:
+                data = base64.b64decode(item.content_b64, validate=True)
+                save_attachment_bytes(conn, ticket_id=ticket_id, message_id=message_id, outbox_id=None,
+                    direction="inbound", filename=item.filename, content_type=item.content_type, data=data, created_at=ts)
+            except (ValueError, HTTPException):
+                logging.getLogger("ticket-mail").warning("skip invalid inbound attachment ticket=%s filename=%s", ticket_id, item.filename)
         send_ack = not ticket and not mail.historical and should_send_ticket_ack(str(mail.sender_email))
         if send_ack:
             ack = (
