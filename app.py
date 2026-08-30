@@ -9,6 +9,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 from cryptography.fernet import Fernet, InvalidToken
+import pymysql
 
 
 ROOT = Path(__file__).resolve().parent
@@ -34,6 +36,17 @@ login_attempts: dict[str, list[float]] = {}
 DEFAULT_WORKSPACE_ID = "geekforest"
 MAILBOX_TAGS = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "未分类")
 AI_CATEGORIES = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "疑似垃圾邮件", "其他", "待分类")
+INTERNAL_PROJECT_API_PREFIX = "/api/internal/projects"
+
+
+def internal_api_authorized(request: Request) -> bool:
+    expected = os.getenv("TICKET_INTERNAL_API_TOKEN", "")
+    supplied = request.headers.get("authorization", "")
+    if supplied.lower().startswith("bearer "):
+        supplied = supplied[7:].strip()
+    else:
+        supplied = request.headers.get("x-ticket-api-key", "")
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
 
 
 def session_token(user_id: str, workspace_id: str, expires: int) -> str:
@@ -88,6 +101,10 @@ def password_matches(password: str, stored: str) -> bool:
 
 @app.middleware("http")
 async def require_login(request: Request, call_next):
+    if request.url.path.startswith(INTERNAL_PROJECT_API_PREFIX):
+        if internal_api_authorized(request):
+            return await call_next(request)
+        return JSONResponse({"ok": False, "error": "INVALID_API_TOKEN"}, status_code=401)
     if request.url.path in {"/login", "/api/auth/login"} or request.url.path.startswith("/static/"):
         return await call_next(request)
     if not valid_session(request.cookies.get("ticket_session")):
@@ -99,6 +116,102 @@ async def require_login(request: Request, call_next):
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@contextmanager
+def project_api_db():
+    required = ("TICKET_API_DB_HOST", "TICKET_API_DB_USER", "TICKET_API_DB_PASSWORD", "TICKET_API_DB_NAME")
+    if any(not os.getenv(key) for key in required):
+        raise HTTPException(503, detail={"error": "PROJECT_DATABASE_NOT_CONFIGURED"})
+    try:
+        conn = pymysql.connect(host=os.environ["TICKET_API_DB_HOST"], port=int(os.getenv("TICKET_API_DB_PORT", "3306")),
+            user=os.environ["TICKET_API_DB_USER"], password=os.environ["TICKET_API_DB_PASSWORD"],
+            database=os.environ["TICKET_API_DB_NAME"], charset="utf8mb4", autocommit=False,
+            connect_timeout=8, read_timeout=15, write_timeout=15, cursorclass=pymysql.cursors.DictCursor)
+    except Exception:
+        raise HTTPException(503, detail={"error": "PROJECT_DATABASE_UNAVAILABLE"})
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_project_api_db() -> None:
+    try:
+        with project_api_db() as conn, conn.cursor() as cursor:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS ticket_api_projects (
+                id VARCHAR(36) PRIMARY KEY, business_code VARCHAR(64) NOT NULL UNIQUE, name VARCHAR(160) NOT NULL,
+                description VARCHAR(1000) NOT NULL DEFAULT '', workspace_id VARCHAR(64) NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending', gitlab_project_id BIGINT NULL,
+                gitlab_web_url VARCHAR(500) NULL, gitlab_ssh_url VARCHAR(500) NULL,
+                last_error_code VARCHAR(80) NULL, created_by VARCHAR(120) NOT NULL,
+                created_at DATETIME(6) NOT NULL, updated_at DATETIME(6) NOT NULL,
+                INDEX idx_ticket_api_projects_workspace (workspace_id,status,updated_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS ticket_api_project_audit (
+                id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, project_id VARCHAR(36) NULL,
+                business_code VARCHAR(64) NOT NULL, action VARCHAR(64) NOT NULL, actor VARCHAR(120) NOT NULL,
+                request_id VARCHAR(120) NULL, source_ip VARCHAR(80) NULL, result VARCHAR(32) NOT NULL,
+                details_json JSON NULL, created_at DATETIME(6) NOT NULL,
+                INDEX idx_ticket_api_audit_project_time (project_id,created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+    except Exception as exc:
+        logging.getLogger("ticket-project-api").warning("project API database init failed type=%s", type(exc).__name__)
+
+
+def mysql_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+class InternalProjectCreate(BaseModel):
+    business_code: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    name: str = Field(min_length=2, max_length=160)
+    description: str = Field(default="", max_length=1000)
+    workspace_id: str = Field(default="geekforest", min_length=2, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    auto_create_gitlab: bool = True
+
+
+class InternalProjectUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=160)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    status: Optional[str] = Field(default=None, pattern=r"^(active|paused|archived)$")
+
+
+def project_api_actor(request: Request) -> str:
+    return (request.headers.get("x-business-client") or "internal-service")[:120]
+
+
+def project_api_audit(cursor, project_id: Optional[str], business_code: str, action: str, request: Request, result: str, details: Optional[dict] = None):
+    cursor.execute("""INSERT INTO ticket_api_project_audit
+        (project_id,business_code,action,actor,request_id,source_ip,result,details_json,created_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (project_id, business_code, action, project_api_actor(request),
+        (request.headers.get("x-request-id") or "")[:120] or None, request.client.host if request.client else None,
+        result, json.dumps(details, ensure_ascii=False) if details else None, mysql_now()))
+
+
+def create_gitlab_project(business_code: str, name: str, description: str) -> dict:
+    base_url = os.getenv("GITLAB_BASE_URL", "").rstrip("/")
+    token = os.getenv("GITLAB_API_TOKEN", "")
+    namespace = os.getenv("GITLAB_NAMESPACE_ID", "")
+    if not base_url or not token or not namespace:
+        raise HTTPException(503, detail={"error": "GITLAB_NOT_CONFIGURED"})
+    data = urllib.parse.urlencode({"name": name, "path": business_code, "namespace_id": namespace,
+        "description": description, "visibility": "private", "initialize_with_readme": "false"}).encode()
+    req = urllib.request.Request(base_url + "/api/v4/projects", data=data,
+        headers={"PRIVATE-TOKEN": token, "Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        error = "GITLAB_PROJECT_EXISTS" if exc.code == 400 else "GITLAB_CREATE_FAILED"
+        raise HTTPException(409 if exc.code == 400 else 502, detail={"error": error})
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        raise HTTPException(502, detail={"error": "GITLAB_UNAVAILABLE"})
+    return {"id": payload.get("id"), "web_url": payload.get("web_url"), "ssh_url": payload.get("ssh_url_to_repo")}
 
 
 @contextmanager
@@ -122,7 +235,7 @@ def init_db() -> None:
         migrations = {
             "mailboxes": [("enabled", "INTEGER NOT NULL DEFAULT 1"), ("workspace_id", "TEXT NOT NULL DEFAULT 'geekforest'"), ("mailbox_tag", "TEXT NOT NULL DEFAULT '未分类'")],
             "messages": [("provider_message_id", "TEXT"), ("internet_message_id", "TEXT"), ("references_header", "TEXT")],
-            "outbox": [("updated_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("internet_message_id", "TEXT"), ("in_reply_to", "TEXT"), ("references_header", "TEXT")],
+            "outbox": [("updated_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("internet_message_id", "TEXT"), ("in_reply_to", "TEXT"), ("references_header", "TEXT"), ("cc_emails", "TEXT"), ("bcc_emails", "TEXT")],
             "mailbox_sync": [("backfill_active", "INTEGER NOT NULL DEFAULT 0"), ("backfill_target_uid", "INTEGER"), ("last_backfill_at", "TEXT")],
             "tickets": [("ai_category", "TEXT NOT NULL DEFAULT '待分类'"), ("ai_category_status", "TEXT NOT NULL DEFAULT 'pending'"), ("ai_category_confidence", "REAL"), ("ai_category_reason", "TEXT"), ("ai_category_source", "TEXT NOT NULL DEFAULT 'ai'"), ("ai_classified_at", "TEXT")],
         }
@@ -192,6 +305,15 @@ def shutdown() -> None:
 class ReplyIn(BaseModel):
     body: str = Field(min_length=1, max_length=20_000)
     close_after_send: bool = False
+
+
+class ComposeMailIn(BaseModel):
+    mailbox_id: str = Field(min_length=1, max_length=160)
+    to_email: EmailStr
+    cc: str = Field(default="", max_length=4000)
+    bcc: str = Field(default="", max_length=4000)
+    subject: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=20_000)
 
 
 class LoginIn(BaseModel):
@@ -675,6 +797,50 @@ def reply(ticket_id: str, payload: ReplyIn, request: Request):
         conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header) VALUES(?,?,?,?,?,'queued',?,?,?,?)", (str(uuid.uuid4()), ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", payload.body, ts, ts, in_reply_to, references))
         conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if payload.close_after_send else "pending", ts, ticket_id))
     return {"ok": True, "message_id": message_id, "delivery": "queued"}
+
+
+@app.post("/api/tickets/compose")
+def compose_mail(payload: ComposeMailIn, request: Request):
+    context = current_context(request)
+    recipient = str(payload.to_email).strip().lower()
+    subject, body, ts = payload.subject.strip(), payload.body.strip(), now()
+    def parse_recipients(raw: str) -> list[str]:
+        values = [part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()]
+        result = []
+        for value in values:
+            try:
+                result.append(str(EmailStr(value)))
+            except Exception:
+                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value})
+        return list(dict.fromkeys(result))
+    cc_emails, bcc_emails = parse_recipients(payload.cc), parse_recipients(payload.bcc)
+    if not subject or not body:
+        raise HTTPException(422, detail={"error": "SUBJECT_AND_BODY_REQUIRED"})
+    with db() as conn:
+        mailbox = conn.execute("SELECT id,name,email FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1",
+            (payload.mailbox_id, context["workspace_id"])).fetchone()
+        if not mailbox:
+            raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
+        sequence = conn.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id,5) AS INTEGER)),1048)+1 FROM tickets").fetchone()[0]
+        ticket_id, message_id = f"TKT-{sequence}", str(uuid.uuid4())
+        customer_name = recipient.split("@", 1)[0][:120]
+        conn.execute("""INSERT INTO tickets
+            (id,subject,customer_name,customer_email,mailbox_id,status,priority,assignee,ai_category,
+             ai_category_status,ai_category_source,created_at,updated_at)
+            VALUES(?,?,?,?,?,'pending','normal',?,'其他','classified','manual',?,?)""",
+            (ticket_id, subject, customer_name, recipient, mailbox["id"], context["display_name"], ts, ts))
+        conn.execute("""INSERT INTO messages
+            (id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read)
+            VALUES(?,?,?,?,?,?,?,1)""",
+            (message_id, ticket_id, "outbound", context["display_name"], mailbox["email"], body, ts))
+        conn.execute("""INSERT INTO outbox
+            (id,ticket_id,to_email,subject,body,status,created_at,updated_at,cc_emails,bcc_emails)
+            VALUES(?,?,?,?,?,'queued',?,?,?,?)""",
+            (str(uuid.uuid4()), ticket_id, recipient, f"[{ticket_id}] {subject}", body, ts, ts, ",".join(cc_emails), ",".join(bcc_emails)))
+    logging.getLogger("ticket-audit").info("outbound ticket composed actor=%s workspace=%s ticket=%s mailbox=%s recipient=%s ip=%s",
+        context["username"], context["workspace_id"], ticket_id, payload.mailbox_id, recipient,
+        request.client.host if request.client else "unknown")
+    return {"ok": True, "ticket_id": ticket_id, "delivery": "queued"}
 
 
 @app.patch("/api/tickets/{ticket_id}")

@@ -297,6 +297,9 @@ class MailWorker:
             sender_candidate = (os.getenv("TICKET_SMTP_FROM") or smtp_user or cfg.get("username") or cfg["email"]).strip()
             sender = sender_candidate if "@" in sender_candidate else cfg["email"]
             msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, row["to_email"], row["subject"], formatdate(localtime=False), message_id
+            cc = [x.strip() for x in (row["cc_emails"] or "").split(",") if x.strip()]
+            bcc = [x.strip() for x in (row["bcc_emails"] or "").split(",") if x.strip()]
+            if cc: msg["Cc"] = ", ".join(cc)
             if cfg["email"].lower() != sender.lower():
                 msg["Reply-To"] = cfg["email"]
             if row["in_reply_to"]: msg["In-Reply-To"] = row["in_reply_to"]
@@ -308,7 +311,7 @@ class MailWorker:
                 else:
                     smtp = smtplib.SMTP(smtp_host, smtp_port); smtp.starttls(context=ssl.create_default_context())
                 try:
-                    smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"]])
+                    smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"], *cc, *bcc])
                 finally: smtp.quit()
                 with self.db() as conn: conn.execute("UPDATE outbox SET status='sent',internet_message_id=?,last_error=NULL,updated_at=datetime('now') WHERE id=?", (message_id, row["id"]))
             except Exception as exc:
