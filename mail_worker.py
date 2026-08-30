@@ -169,6 +169,14 @@ class MailWorker:
             try:
                 configs = load_configs(self.root)
                 self._sync_config(configs)
+                # Outbound mail is latency-sensitive and must not depend on IMAP.
+                # A slow or broken inbox (for example, an expired certificate)
+                # must never prevent another mailbox from draining its outbox.
+                for cfg in configs:
+                    try:
+                        self._send_box(cfg)
+                    except Exception:
+                        log.exception("mailbox send cycle failed for %s", cfg.get("id"))
                 per_cycle = max(1, int(os.getenv("TICKET_MAILBOXES_PER_CYCLE", "5")))
                 if len(configs) > per_cycle:
                     start = self.config_cursor % len(configs)
@@ -179,9 +187,8 @@ class MailWorker:
                 for cfg in selected:
                     try:
                         self._receive_box(cfg)
-                        self._send_box(cfg)
                     except Exception:
-                        log.exception("mailbox cycle failed for %s", cfg.get("id"))
+                        log.exception("mailbox receive cycle failed for %s", cfg.get("id"))
                 try:
                     from app import classify_pending_tickets
                     classified = classify_pending_tickets(int(os.getenv("TICKET_AI_CLASSIFY_BATCH", "5")))
@@ -214,7 +221,13 @@ class MailWorker:
 
     def _receive_box(self, cfg):
         from app import IncomingMail
-        client = imaplib.IMAP4_SSL(cfg["imap_host"], int(cfg.get("imap_port", 993)), ssl_context=ssl.create_default_context())
+        timeout = max(1, int(os.getenv("TICKET_IMAP_TIMEOUT_SECONDS", "15")))
+        client = imaplib.IMAP4_SSL(
+            cfg["imap_host"],
+            int(cfg.get("imap_port", 993)),
+            ssl_context=ssl.create_default_context(),
+            timeout=timeout,
+        )
         try:
             client.login(cfg.get("username", cfg["email"]), self._password(cfg))
             client.select(cfg.get("imap_folder", "INBOX"))
@@ -306,10 +319,17 @@ class MailWorker:
             if row["references_header"]: msg["References"] = row["references_header"]
             msg.set_content(row["body"])
             try:
+                timeout = max(1, int(os.getenv("TICKET_SMTP_TIMEOUT_SECONDS", "20")))
                 if smtp_ssl:
-                    smtp = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ssl.create_default_context())
+                    smtp = smtplib.SMTP_SSL(
+                        smtp_host,
+                        smtp_port,
+                        timeout=timeout,
+                        context=ssl.create_default_context(),
+                    )
                 else:
-                    smtp = smtplib.SMTP(smtp_host, smtp_port); smtp.starttls(context=ssl.create_default_context())
+                    smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=timeout)
+                    smtp.starttls(context=ssl.create_default_context())
                 try:
                     smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[row["to_email"], *cc, *bcc])
                 finally: smtp.quit()
