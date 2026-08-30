@@ -42,6 +42,21 @@ def _delivery_report(msg: email.message.Message) -> tuple[str, str, str] | None:
     return original.group(1), status, (diagnostic.group(1).strip() if diagnostic else value)[:500]
 
 
+def _read_receipt(msg: email.message.Message) -> tuple[str, str] | None:
+    """Return (internet_message_id, detail) for a standards-based MDN read receipt."""
+    content_type = msg.get_content_type().lower()
+    report_type = (msg.get_param("report-type") or "").lower()
+    if content_type != "multipart/report" or report_type != "disposition-notification":
+        return None
+    report_parts = [str(part) for part in msg.walk() if part.get_content_type() == "message/disposition-notification"]
+    report = "\n".join(report_parts) or _body(msg)
+    original = re.search(r"Original-Message-ID:\s*(<[^>]+>)", report, re.I)
+    disposition = re.search(r"Disposition:\s*([^\r\n]+)", report, re.I)
+    if not original or not disposition or not re.search(r"\bdisplayed\b", disposition.group(1), re.I):
+        return None
+    return original.group(1), disposition.group(1).strip()[:500]
+
+
 def _decode(value: str | None) -> str:
     if not value:
         return ""
@@ -273,6 +288,20 @@ class MailWorker:
                 typ, fetched = client.uid("fetch", raw_uid, "(RFC822)")
                 if typ != "OK" or not fetched or not isinstance(fetched[0], tuple): continue
                 msg = email.message_from_bytes(fetched[0][1])
+                receipt = _read_receipt(msg)
+                if receipt:
+                    original_id, detail = receipt
+                    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    with self.db() as conn:
+                        row = conn.execute("SELECT id,message_id FROM outbox WHERE internet_message_id=?", (original_id,)).fetchone()
+                        if row:
+                            conn.execute("UPDATE outbox SET opened_at=COALESCE(opened_at,?),delivered_at=COALESCE(delivered_at,?),open_count=open_count+1,updated_at=? WHERE id=?", (ts, ts, ts, row["id"]))
+                            if row["message_id"]:
+                                conn.execute("UPDATE messages SET delivery_status='read',opened_at=COALESCE(opened_at,?),delivered_at=COALESCE(delivered_at,?),open_count=open_count+1,delivery_error=NULL WHERE id=?", (ts, ts, row["message_id"]))
+                    with self.db() as conn:
+                        conn.execute("UPDATE mailbox_sync SET last_uid=?,updated_at=datetime('now') WHERE mailbox_id=?", (uid, cfg["id"]))
+                    log.info("processed read receipt for %s: %s", original_id, detail)
+                    continue
                 report = _delivery_report(msg)
                 if report:
                     original_id, delivery_status, detail = report
@@ -336,6 +365,10 @@ class MailWorker:
             sender = sender_candidate if "@" in sender_candidate else cfg["email"]
             to_emails = [x.strip() for x in (row["to_emails"] or row["to_email"] or "").split(",") if x.strip()]
             msg["From"], msg["To"], msg["Subject"], msg["Date"], msg["Message-ID"] = sender, ", ".join(to_emails), row["subject"], formatdate(localtime=False), message_id
+            # Ask standards-compliant clients for an MDN. Recipients may decline
+            # or their provider may suppress it, so absence is never treated as unread.
+            msg["Disposition-Notification-To"] = sender
+            msg["Return-Receipt-To"] = sender
             cc = [x.strip() for x in (row["cc_emails"] or "").split(",") if x.strip()]
             bcc = [x.strip() for x in (row["bcc_emails"] or "").split(",") if x.strip()]
             if cc: msg["Cc"] = ", ".join(cc)
@@ -355,7 +388,12 @@ class MailWorker:
                 else:
                     smtp = smtplib.SMTP(smtp_host, smtp_port); smtp.starttls(context=ssl.create_default_context())
                 try:
-                    smtp.login(smtp_user, smtp_password); smtp.send_message(msg, from_addr=sender, to_addrs=[*to_emails, *cc, *bcc])
+                    smtp.login(smtp_user, smtp_password)
+                    send_kwargs = {"from_addr": sender, "to_addrs": [*to_emails, *cc, *bcc]}
+                    if smtp.has_extn("dsn"):
+                        send_kwargs["mail_options"] = ("RET=HDRS", f"ENVID={row['id']}")
+                        send_kwargs["rcpt_options"] = ("NOTIFY=SUCCESS,FAILURE,DELAY",)
+                    smtp.send_message(msg, **send_kwargs)
                 finally: smtp.quit()
                 sent_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 with self.db() as conn:

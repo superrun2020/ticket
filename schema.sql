@@ -21,16 +21,20 @@ CREATE INDEX IF NOT EXISTS idx_category_feedback_workspace_time ON ai_category_f
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
   sender_name TEXT NOT NULL, sender_email TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0,
-  provider_message_id TEXT UNIQUE, internet_message_id TEXT, references_header TEXT
+  provider_message_id TEXT UNIQUE, internet_message_id TEXT, references_header TEXT,
+  delivery_status TEXT NOT NULL DEFAULT 'received', sent_at TEXT, delivered_at TEXT, opened_at TEXT, failed_at TEXT,
+  open_count INTEGER NOT NULL DEFAULT 0, delivery_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ticket_time ON messages(ticket_id, created_at);
 CREATE TABLE IF NOT EXISTS outbox (
   id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), to_email TEXT NOT NULL,
   subject TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','sending','sent','failed')),
   created_at TEXT NOT NULL, updated_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-  internet_message_id TEXT, in_reply_to TEXT, references_header TEXT
+  internet_message_id TEXT, in_reply_to TEXT, references_header TEXT, message_id TEXT,
+  tracking_token TEXT, delivered_at TEXT, opened_at TEXT, open_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_status_created ON outbox(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_tracking_token ON outbox(tracking_token) WHERE tracking_token IS NOT NULL;
 CREATE TABLE IF NOT EXISTS mailbox_sync (
   mailbox_id TEXT PRIMARY KEY REFERENCES mailboxes(id), last_uid INTEGER NOT NULL DEFAULT 0,
   backfill_active INTEGER NOT NULL DEFAULT 0, backfill_target_uid INTEGER,
