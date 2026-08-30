@@ -38,7 +38,14 @@ login_attempts: dict[str, list[float]] = {}
 DEFAULT_WORKSPACE_ID = "geekforest"
 MAILBOX_TAGS = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "未分类")
 AI_CATEGORIES = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "疑似垃圾邮件", "其他", "待分类")
+WORKSPACE_MAILBOX_TAGS = {
+    "gcy": ("PID邮箱", "网盟邮箱"),
+}
+WORKSPACE_AI_CATEGORIES = {
+    "gcy": ("PID邮箱", "网盟邮箱", "疑似垃圾邮件", "待分类"),
+}
 INTERNAL_PROJECT_API_PREFIX = "/api/internal/projects"
+SYSTEM_SENDER_PREFIXES = ("mailer-daemon@", "postmaster@", "no-reply@", "noreply@", "bounce@", "do-not-reply@")
 
 
 def internal_api_authorized(request: Request) -> bool:
@@ -499,6 +506,26 @@ def unique_workspace_slug(conn: sqlite3.Connection, preferred: str) -> str:
     return slug
 
 
+def mailbox_tags_for_workspace(workspace_id: str) -> tuple[str, ...]:
+    return WORKSPACE_MAILBOX_TAGS.get(workspace_id, MAILBOX_TAGS)
+
+
+def ai_categories_for_workspace(workspace_id: str) -> tuple[str, ...]:
+    return WORKSPACE_AI_CATEGORIES.get(workspace_id, AI_CATEGORIES)
+
+
+def ensure_workspace_mailbox_tag(workspace_id: str, tag: str) -> str:
+    allowed = mailbox_tags_for_workspace(workspace_id)
+    if tag not in allowed:
+        raise HTTPException(422, detail={"error": "INVALID_MAILBOX_TAG"})
+    return tag
+
+
+def should_send_ticket_ack(sender_email: str) -> bool:
+    value = sender_email.strip().lower()
+    return bool(value and "@" in value and not any(value.startswith(prefix) for prefix in SYSTEM_SENDER_PREFIXES))
+
+
 def ask_ai(instructions: str, text: str) -> str:
     config = get_ai_config()
     api_key = config["api_key"]
@@ -545,7 +572,8 @@ def classify_pending_tickets(limit: int = 5) -> int:
             if len(body) < 15 or body in {"（无正文）", "(无正文)", "no body"}:
                 category, confidence, reason = "疑似垃圾邮件", 0.88, "正文过短或缺失，需人工复核"
             else:
-                allowed_categories = list(dict.fromkeys([*AI_CATEGORIES[:-1], *custom_categories]))
+                workspace_categories = ai_categories_for_workspace(ticket["workspace_id"])
+                allowed_categories = list(dict.fromkeys([*(x for x in workspace_categories if x != "待分类"), *(x for x in custom_categories if x in workspace_categories)]))
                 examples = "\n".join(f"- 主题：{x['subject_snapshot'][:120]}；正文片段：{x['body_snapshot'][:240]}；人工分类：{x['corrected_category']}" for x in learned)
                 source = f"人工纠正样本（越靠前越新）：\n{examples or '暂无'}\n\n待分类邮件：\n主题：{ticket['subject']}\n正文：{body[:6000]}"
                 raw = ask_ai(
@@ -686,7 +714,7 @@ def list_google_mailboxes(request: Request):
     with db() as conn:
         rows = [dict(x) for x in conn.execute("""SELECT id,project_code,mailbox_email,mailbox_tag,workspace_id,enabled,
             created_at,updated_at,1 password_configured FROM managed_google_mailboxes ORDER BY updated_at DESC""")]
-    return {"ok": True, "mailboxes": rows, "tag_suggestions": list(MAILBOX_TAGS)}
+    return {"ok": True, "mailboxes": rows, "tag_suggestions": list(mailbox_tags_for_workspace(context["workspace_id"]))}
 
 
 @app.post("/api/admin/google-mailboxes")
@@ -695,6 +723,7 @@ def save_google_mailbox(payload: GoogleMailboxIn, request: Request):
     if not context["is_admin"]:
         raise HTTPException(403, detail={"error": "ADMIN_REQUIRED"})
     email_address = str(payload.mailbox_email).strip().lower()
+    mailbox_tag = ensure_workspace_mailbox_tag("geekforest", payload.mailbox_tag)
     password = (payload.app_password or "").replace(" ", "")
     with db() as conn:
         existing = conn.execute("SELECT id FROM managed_google_mailboxes WHERE mailbox_email=?", (email_address,)).fetchone()
@@ -704,9 +733,9 @@ def save_google_mailbox(payload: GoogleMailboxIn, request: Request):
                 raise HTTPException(422, detail={"error": "GOOGLE_APP_PASSWORD_MUST_BE_16_CHARS"})
             if password:
                 encrypted = secret_box().encrypt(password.encode()).decode()
-                conn.execute("UPDATE managed_google_mailboxes SET project_code=?,password_ciphertext=?,mailbox_tag=?,updated_at=? WHERE id=?", (payload.project_code, encrypted, payload.mailbox_tag, ts, existing["id"]))
+                conn.execute("UPDATE managed_google_mailboxes SET project_code=?,password_ciphertext=?,mailbox_tag=?,updated_at=? WHERE id=?", (payload.project_code, encrypted, mailbox_tag, ts, existing["id"]))
             else:
-                conn.execute("UPDATE managed_google_mailboxes SET project_code=?,mailbox_tag=?,updated_at=? WHERE id=?", (payload.project_code, payload.mailbox_tag, ts, existing["id"]))
+                conn.execute("UPDATE managed_google_mailboxes SET project_code=?,mailbox_tag=?,updated_at=? WHERE id=?", (payload.project_code, mailbox_tag, ts, existing["id"]))
             mailbox_id, created = existing["id"], False
         else:
             if len(password) != 16:
@@ -715,16 +744,16 @@ def save_google_mailbox(payload: GoogleMailboxIn, request: Request):
             encrypted = secret_box().encrypt(password.encode()).decode()
             conn.execute("""INSERT INTO managed_google_mailboxes
                 (id,project_code,mailbox_email,password_ciphertext,mailbox_tag,workspace_id,enabled,created_by,created_at,updated_at)
-                VALUES(?,?,?,?,?,'geekforest',1,?,?,?)""", (mailbox_id, payload.project_code, email_address, encrypted, payload.mailbox_tag, context["username"], ts, ts))
+                VALUES(?,?,?,?,?,'geekforest',1,?,?,?)""", (mailbox_id, payload.project_code, email_address, encrypted, mailbox_tag, context["username"], ts, ts))
         try:
             conn.execute("""INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag)
                 VALUES(?,?,?,'#4285f4',?,1,'geekforest',?)
                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,email=excluded.email,enabled=1,mailbox_tag=excluded.mailbox_tag""",
-                (mailbox_id, payload.project_code, email_address, ts, payload.mailbox_tag))
+                (mailbox_id, payload.project_code, email_address, ts, mailbox_tag))
             conn.execute("INSERT OR IGNORE INTO mailbox_sync(mailbox_id,last_uid,updated_at) VALUES(?,0,?)", (mailbox_id, ts))
         except sqlite3.IntegrityError:
             raise HTTPException(409, detail={"error": "MAILBOX_EMAIL_ALREADY_EXISTS"})
-    logging.getLogger("ticket-audit").info("google mailbox saved actor=%s mailbox_id=%s created=%s tag=%s ip=%s", context["username"], mailbox_id, created, payload.mailbox_tag, request.client.host if request.client else "unknown")
+    logging.getLogger("ticket-audit").info("google mailbox saved actor=%s mailbox_id=%s created=%s tag=%s ip=%s", context["username"], mailbox_id, created, mailbox_tag, request.client.host if request.client else "unknown")
     return {"ok": True, "id": mailbox_id, "created": created, "password_configured": True}
 
 
@@ -755,8 +784,9 @@ def mail_service_catalog(request: Request):
         counts[account["domain_name"]] = counts.get(account["domain_name"], 0) + 1
     for domain in domains:
         domain["mailbox_count"] = counts.get(domain["name"], 0)
+    tag_suggestions = {w["id"]: list(mailbox_tags_for_workspace(w["id"])) for w in workspaces}
     return {"ok": True, "service": {"live": live, "warning": warning}, "domains": domains,
-        "mailboxes": accounts, "workspaces": workspaces, "tag_suggestions": list(MAILBOX_TAGS)}
+        "mailboxes": accounts, "workspaces": workspaces, "tag_suggestions": tag_suggestions}
 
 
 @app.post("/api/admin/mail-service/sync")
@@ -800,6 +830,7 @@ def create_mail_service_mailbox(payload: MailServiceMailboxIn, request: Request)
     with db() as conn:
         if not conn.execute("SELECT 1 FROM workspaces WHERE id=?", (payload.workspace_id,)).fetchone():
             raise HTTPException(422, detail={"error": "INVALID_WORKSPACE"})
+    mailbox_tag = ensure_workspace_mailbox_tag(payload.workspace_id, payload.mailbox_tag)
     result = stalwart_jmap([["x:Account/set", {"create": {"new": {"@type": "User", "name": username,
         "domainId": str(domain_record["id"]), "description": payload.display_name.strip(),
         "credentials": {"0": {"@type": "Password", "secret": payload.password}}}}}, "createMailbox"]])
@@ -812,10 +843,10 @@ def create_mail_service_mailbox(payload: MailServiceMailboxIn, request: Request)
         conn.execute("""INSERT INTO managed_stalwart_mailboxes
             (id,account_id,mailbox_email,display_name,password_ciphertext,mailbox_tag,workspace_id,enabled,created_by,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?,1,?,?,?)""", (mailbox_id, account_id, email_address, payload.display_name.strip(), encrypted,
-            payload.mailbox_tag, payload.workspace_id, context["username"], ts, ts))
+            mailbox_tag, payload.workspace_id, context["username"], ts, ts))
         conn.execute("""INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag)
             VALUES(?,?,?,'#6558d3',?,1,?,?)""", (mailbox_id, payload.display_name.strip() or username, email_address,
-            ts, payload.workspace_id, payload.mailbox_tag))
+            ts, payload.workspace_id, mailbox_tag))
         conn.execute("INSERT INTO mailbox_sync(mailbox_id,last_uid,updated_at) VALUES(?,0,?)", (mailbox_id, ts))
     sync_stalwart_catalog()
     logging.getLogger("ticket-audit").info("mailbox created actor=%s mailbox=%s account=%s workspace=%s ip=%s",
@@ -974,8 +1005,10 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
             FROM mailboxes m LEFT JOIN tickets t ON t.mailbox_id=m.id LEFT JOIN messages msg ON msg.ticket_id=t.id
             WHERE m.workspace_id=? GROUP BY m.id
             ORDER BY latest_message_at IS NULL, latest_message_at DESC, m.name""", (context["workspace_id"],))]
-    tag_options = list(dict.fromkeys([*MAILBOX_TAGS, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag"))]))
-    category_options = list(dict.fromkeys([*AI_CATEGORIES, *category_counts.keys()]))
+    allowed_tags = mailbox_tags_for_workspace(context["workspace_id"])
+    tag_options = list(dict.fromkeys([*allowed_tags, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag") in allowed_tags)]))
+    allowed_categories = ai_categories_for_workspace(context["workspace_id"])
+    category_options = list(dict.fromkeys([*allowed_categories, *(x for x in category_counts.keys() if x in allowed_categories)]))
     return {"ok": True, "tickets": tickets, "counts": counts, "summary": {"unprocessed": counts.get("open", 0), "unread_messages": unread_messages}, "mailboxes": boxes, "tag_options": tag_options, "category_options": category_options, "category_counts": category_counts}
 
 
@@ -987,25 +1020,27 @@ def mailbox_tags(request: Request):
         stats = [row_dict(x) for x in conn.execute("""SELECT m.mailbox_tag tag,COUNT(DISTINCT m.id) mailboxes,COUNT(DISTINCT t.id) tickets,
             SUM(CASE WHEN t.status='open' THEN 1 ELSE 0 END) open_tickets
             FROM mailboxes m LEFT JOIN tickets t ON t.mailbox_id=m.id WHERE m.workspace_id=? GROUP BY m.mailbox_tag""", (context["workspace_id"],))]
-    options = list(dict.fromkeys([*MAILBOX_TAGS, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag"))]))
+    allowed_tags = mailbox_tags_for_workspace(context["workspace_id"])
+    options = list(dict.fromkeys([*allowed_tags, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag") in allowed_tags)]))
     return {"ok": True, "options": options, "mailboxes": boxes, "stats": stats}
 
 
 @app.patch("/api/mailboxes/{mailbox_id}/tag")
 def update_mailbox_tag(mailbox_id: str, payload: MailboxTagIn, request: Request):
     context = current_context(request)
+    mailbox_tag = ensure_workspace_mailbox_tag(context["workspace_id"], payload.tag)
     with db() as conn:
-        changed = conn.execute("UPDATE mailboxes SET mailbox_tag=? WHERE id=? AND workspace_id=?", (payload.tag, mailbox_id, context["workspace_id"])).rowcount
+        changed = conn.execute("UPDATE mailboxes SET mailbox_tag=? WHERE id=? AND workspace_id=?", (mailbox_tag, mailbox_id, context["workspace_id"])).rowcount
     if not changed:
         raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
-    logging.getLogger("ticket-audit").info("mailbox tag changed actor=%s workspace=%s mailbox=%s tag=%s ip=%s", context["username"], context["workspace_id"], mailbox_id, payload.tag, request.client.host if request.client else "unknown")
+    logging.getLogger("ticket-audit").info("mailbox tag changed actor=%s workspace=%s mailbox=%s tag=%s ip=%s", context["username"], context["workspace_id"], mailbox_id, mailbox_tag, request.client.host if request.client else "unknown")
     return {"ok": True}
 
 
 @app.post("/api/mailbox-tags/{tag}/analyze")
 def analyze_mailbox_tag(tag: str, request: Request):
     context = current_context(request)
-    if tag not in MAILBOX_TAGS:
+    if tag not in mailbox_tags_for_workspace(context["workspace_id"]):
         raise HTTPException(422, detail={"error": "INVALID_MAILBOX_TAG"})
     with db() as conn:
         rows = list(conn.execute("""SELECT t.id,t.subject,t.status,t.priority,m.email mailbox_email,msg.body,msg.created_at
@@ -1151,10 +1186,17 @@ def receive_mail(mail: IncomingMail):
             ticket_id = f"TKT-{sequence}"
             conn.execute("INSERT INTO tickets(id,subject,customer_name,customer_email,mailbox_id,status,priority,assignee,created_at,updated_at) VALUES(?,?,?,?,?,'open','normal','未分配',?,?)", (ticket_id, mail.subject, mail.sender_name, str(mail.sender_email), mail.mailbox_id, ts, ts))
         conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,provider_message_id,internet_message_id,references_header) VALUES(?,?,?,?,?,?,?,?,?,?)", (str(uuid.uuid4()), ticket_id, "inbound", mail.sender_name, str(mail.sender_email), mail.body, ts, mail.provider_message_id, mail.internet_message_id, mail.references_header))
-        if not ticket and not mail.historical:
-            ack = f"您好 {mail.sender_name}，\n\n我们已收到您的邮件并创建工单 {ticket_id}。客服团队会尽快回复，后续回复此邮件即可继续沟通。\n\nPostPilot 客户支持"
-            conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header) VALUES(?,?,?,?,?,'queued',?,?,?,?)", (str(uuid.uuid4()), ticket_id, str(mail.sender_email), f"[{ticket_id}] 工单已创建：{mail.subject}", ack, ts, ts, mail.internet_message_id, mail.references_header or mail.internet_message_id))
-    return {"ok": True, "ticket_id": ticket_id, "created": ticket is None, "confirmation_email": "queued" if not ticket and not mail.historical else None}
+        send_ack = not ticket and not mail.historical and should_send_ticket_ack(str(mail.sender_email))
+        if send_ack:
+            ack = (
+                f"Hello {mail.sender_name},\n\n"
+                f"We have received your email and created ticket {ticket_id}. "
+                "Our support team will review it and get back to you as soon as possible.\n\n"
+                "Please reply to this email to continue the conversation.\n\n"
+                "GeekForest Support"
+            )
+            conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header) VALUES(?,?,?,?,?,'queued',?,?,?,?)", (str(uuid.uuid4()), ticket_id, str(mail.sender_email), f"[{ticket_id}] Ticket created: {mail.subject}", ack, ts, ts, mail.internet_message_id, mail.references_header or mail.internet_message_id))
+    return {"ok": True, "ticket_id": ticket_id, "created": ticket is None, "confirmation_email": "queued" if not ticket and not mail.historical and should_send_ticket_ack(str(mail.sender_email)) else None}
 
 
 @app.get("/api/outbox")
