@@ -18,14 +18,14 @@ function categoryPickerMarkup(ticket){
   const category=ticket.ai_category||'待分类';
   const source=ticket.ai_category_status==='pending'?'等待 AI 识别':ticket.ai_category_source==='manual'?'人工调整 · AI 已学习':`AI 自动识别${ticket.ai_category_confidence!=null?` · ${Math.round(Number(ticket.ai_category_confidence)*100)}%`:''}`;
   return `<div class="ticket-category-picker">
-    <span class="ticket-category-label">分类</span>
-    <button class="ticket-category-trigger ${category==='疑似垃圾邮件'?'spam':''}" id="ticketCategoryTrigger" type="button" aria-haspopup="listbox" aria-expanded="false"><i>✦</i><strong id="ticketCategoryValue">${esc(category)}</strong><b>⌄</b></button>
+    <span class="ticket-category-label">标签</span>
+    <button class="ticket-category-trigger ${category==='疑似垃圾邮件'?'spam':''}" id="ticketCategoryTrigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-label="选择工单标签"><i>⌂</i><strong id="ticketCategoryValue">${esc(category)}</strong><span class="ticket-category-action">选择标签</span><b>⌄</b></button>
     <span class="ticket-category-source" id="ticketCategorySource">${esc(source)}</span>
     <div class="ticket-category-popover" id="ticketCategoryPopover" hidden>
-      <div class="category-popover-head"><div><strong>工单分类</strong><small>选择已有分类或创建新分类</small></div><span>AI 学习</span></div>
-      <label class="category-search">⌕<input id="ticketCategorySearch" maxlength="40" placeholder="搜索或输入新分类"></label>
+      <div class="category-popover-head"><div><strong>工单标签</strong><small>选择已有标签或创建新标签</small></div><span>AI 学习</span></div>
+      <label class="category-search">⌕<input id="ticketCategorySearch" maxlength="40" placeholder="搜索或输入新标签"></label>
       <div class="category-option-list" id="ticketCategoryOptions" role="listbox">${state.categoryOptions.map(x=>`<button type="button" role="option" data-ticket-category="${esc(x)}" class="${x===category?'selected':''}"><i>✦</i><span>${esc(x)}</span>${x===category?'<b>✓</b>':''}</button>`).join('')}</div>
-      <button class="category-create" id="ticketCategoryCreate" type="button" hidden>＋ 创建分类 “<span></span>”</button>
+      <button class="category-create" id="ticketCategoryCreate" type="button" hidden>＋ 创建标签 “<span></span>”</button>
     </div>
   </div>`;
 }
@@ -39,7 +39,7 @@ async function openTicketV2(id){
   const trigger=$('#ticketCategoryTrigger'),popover=$('#ticketCategoryPopover'),search=$('#ticketCategorySearch'),create=$('#ticketCategoryCreate');
   trigger.onclick=e=>{e.stopPropagation();popover.hidden=!popover.hidden;trigger.setAttribute('aria-expanded',String(!popover.hidden));if(!popover.hidden)search.focus()};
   popover.onclick=e=>e.stopPropagation();
-  const saveCategory=async value=>{value=value.trim();if(!value)return;trigger.disabled=true;try{await patchTicket(id,{ai_category:value},false);$('#ticketCategoryValue').textContent=value;$('#ticketCategorySource').textContent='人工调整 · AI 已学习';trigger.classList.toggle('spam',value==='疑似垃圾邮件');popover.hidden=true;trigger.setAttribute('aria-expanded','false');toast('分类已保存，AI 会学习本次调整')}finally{trigger.disabled=false}};
+  const saveCategory=async value=>{value=value.trim();if(!value)return;trigger.disabled=true;try{await patchTicket(id,{ai_category:value},false);$('#ticketCategoryValue').textContent=value;$('#ticketCategorySource').textContent='人工调整 · AI 已学习';trigger.classList.toggle('spam',value==='疑似垃圾邮件');popover.hidden=true;trigger.setAttribute('aria-expanded','false');toast('标签已保存，AI 会学习本次调整')}finally{trigger.disabled=false}};
   document.querySelectorAll('[data-ticket-category]').forEach(button=>button.onclick=()=>saveCategory(button.dataset.ticketCategory));
   search.oninput=()=>{const value=search.value.trim(),lower=value.toLowerCase();document.querySelectorAll('[data-ticket-category]').forEach(button=>button.hidden=!button.dataset.ticketCategory.toLowerCase().includes(lower));const exists=state.categoryOptions.some(x=>x.toLowerCase()===lower);create.hidden=!value||exists;create.querySelector('span').textContent=value};
   search.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();const value=search.value.trim();if(value)saveCategory(value)}if(e.key==='Escape'){popover.hidden=true;trigger.setAttribute('aria-expanded','false')}};

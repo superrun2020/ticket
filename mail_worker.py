@@ -197,7 +197,11 @@ class MailWorker:
         from app import now
         with self.db() as conn:
             for cfg in configs:
-                conn.execute("INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag) VALUES(?,?,?,?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,email=excluded.email,color=excluded.color,enabled=1,workspace_id=excluded.workspace_id,mailbox_tag=excluded.mailbox_tag", (cfg["id"], cfg["name"], cfg["email"], cfg.get("color", "#6558d3"), now(), cfg.get("workspace_id", "geekforest"), cfg.get("mailbox_tag", "未分类")))
+                identity = " ".join(str(cfg.get(key, "")) for key in ("id", "name", "email")).lower()
+                mailbox_tag = "NOC-ASN邮箱" if "noc" in identity else cfg.get("mailbox_tag", "未分类")
+                if mailbox_tag == "ASN邮箱":
+                    mailbox_tag = "NOC-ASN邮箱"
+                conn.execute("INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag) VALUES(?,?,?,?,?,1,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,email=excluded.email,color=excluded.color,enabled=1,workspace_id=excluded.workspace_id,mailbox_tag=excluded.mailbox_tag", (cfg["id"], cfg["name"], cfg["email"], cfg.get("color", "#6558d3"), now(), cfg.get("workspace_id", "geekforest"), mailbox_tag))
                 conn.execute("INSERT OR IGNORE INTO mailbox_sync(mailbox_id,last_uid,updated_at) VALUES(?,0,?)", (cfg["id"], now()))
 
     def _password(self, cfg):
