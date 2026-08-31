@@ -286,11 +286,20 @@ def init_db() -> None:
         conn.execute("INSERT OR IGNORE INTO workspaces(id,name,slug,created_at,updated_at) VALUES('geekforest','GeekForest','geekforest',?,?)", (ts, ts))
         conn.execute("INSERT OR IGNORE INTO workspaces(id,name,slug,created_at,updated_at) VALUES('eddy-personal','Eddy 个人工作区','eddy-personal',?,?)", (ts, ts))
         admin = conn.execute("SELECT id FROM users WHERE username=?", (LOGIN_USER,)).fetchone()
-        if not admin and LOGIN_PASSWORD:
+        if admin:
+            admin_id = admin["id"]
+            if LOGIN_PASSWORD:
+                conn.execute("UPDATE users SET password_hash=?,is_admin=1,updated_at=? WHERE id=?", (password_hash(LOGIN_PASSWORD), ts, admin_id))
+        elif LOGIN_PASSWORD:
             admin_id = "user-admin"
-            conn.execute("INSERT INTO users(id,username,display_name,password_hash,is_admin,created_at,updated_at) VALUES(?,?,?,?,1,?,?)", (admin_id, LOGIN_USER, "Oliver", password_hash(LOGIN_PASSWORD), ts, ts))
+            existing_admin = conn.execute("SELECT id FROM users WHERE id=?", (admin_id,)).fetchone()
+            if existing_admin:
+                conn.execute("UPDATE users SET username=?,display_name=?,password_hash=?,is_admin=1,updated_at=? WHERE id=?",
+                    (LOGIN_USER, "Oliver", password_hash(LOGIN_PASSWORD), ts, admin_id))
+            else:
+                conn.execute("INSERT INTO users(id,username,display_name,password_hash,is_admin,created_at,updated_at) VALUES(?,?,?,?,1,?,?)", (admin_id, LOGIN_USER, "Oliver", password_hash(LOGIN_PASSWORD), ts, ts))
         else:
-            admin_id = admin["id"] if admin else None
+            admin_id = None
         if admin_id:
             conn.execute("INSERT OR IGNORE INTO workspace_memberships(user_id,workspace_id,role,created_at) VALUES(?,?,'admin',?)", (admin_id, "geekforest", ts))
             conn.execute("INSERT OR IGNORE INTO workspace_memberships(user_id,workspace_id,role,created_at) VALUES(?,?,'admin',?)", (admin_id, "eddy-personal", ts))
