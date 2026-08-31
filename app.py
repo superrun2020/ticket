@@ -498,6 +498,82 @@ def sync_stalwart_catalog() -> tuple[list[dict], list[dict]]:
     return domains, accounts
 
 
+def create_stalwart_domain_if_missing(domain: str, description: str = "Auto-created from project mailbox source") -> tuple[dict, bool]:
+    domain = normalize_mail_domain(domain)
+    existing = next((x for x in stalwart_list("Domain") if str(x.get("name", "")).lower() == domain), None)
+    if existing:
+        return existing, False
+    result = stalwart_jmap([["x:Domain/set", {"create": {"new": {"name": domain,
+        "description": description[:255], "isEnabled": True}}}, "createDomain"]])
+    created = stalwart_result(result, "createDomain").get("created", {}).get("new")
+    if not created or not created.get("id"):
+        raise HTTPException(502, detail={"error": "DOMAIN_CREATE_FAILED", "domain": domain})
+    return created, True
+
+
+def create_stalwart_account_if_missing(email_address: str, password: str, display_name: str = "") -> tuple[dict, bool]:
+    email_address = email_address.strip().lower()
+    if "@" not in email_address:
+        raise HTTPException(422, detail={"error": "INVALID_MAILBOX_EMAIL"})
+    username, domain = email_address.split("@", 1)
+    username = normalize_mailbox_username(username)
+    domain = normalize_mail_domain(domain)
+    existing = next((x for x in stalwart_list("Account") if public_stalwart_account(x)["email"] == email_address), None)
+    if existing:
+        return existing, False
+    domain_record, _ = create_stalwart_domain_if_missing(domain)
+    result = stalwart_jmap([["x:Account/set", {"create": {"new": {"@type": "User", "name": username,
+        "domainId": str(domain_record["id"]), "description": display_name[:255],
+        "credentials": {"0": {"@type": "Password", "secret": password}}}}}, "createMailbox"]])
+    created = stalwart_result(result, "createMailbox").get("created", {}).get("new")
+    if not created or not created.get("id"):
+        raise HTTPException(502, detail={"error": "MAILBOX_CREATE_FAILED", "email": email_address})
+    return created, True
+
+
+def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
+    """Ensure project source mailboxes also exist in the new Stalwart/Mail2 service."""
+    from mail_worker import load_configs
+    configs = [cfg for cfg in load_configs(ROOT) if str(cfg.get("id", "")).startswith("project-") and cfg.get("email")]
+    if limit:
+        configs = configs[:max(1, limit)]
+    try:
+        domains, accounts = sync_stalwart_catalog()
+    except HTTPException:
+        domains, accounts = [], []
+    existing_domains = {d["name"] for d in domains}
+    existing_accounts = {a["email"] for a in accounts}
+    result = {"checked": 0, "domains_created": 0, "mailboxes_created": 0, "already_exists": 0, "failed": 0, "failures": []}
+    for cfg in configs:
+        email_address = str(cfg.get("email", "")).strip().lower()
+        if "@" not in email_address:
+            continue
+        domain = email_address.rsplit("@", 1)[1]
+        result["checked"] += 1
+        try:
+            if domain not in existing_domains:
+                _, created_domain = create_stalwart_domain_if_missing(domain)
+                if created_domain:
+                    result["domains_created"] += 1
+                    existing_domains.add(domain)
+            if email_address not in existing_accounts:
+                password = str(cfg.get("password") or "")
+                if not password:
+                    raise HTTPException(422, detail={"error": "MAILBOX_PASSWORD_MISSING", "email": email_address})
+                _, created_account = create_stalwart_account_if_missing(email_address, password, str(cfg.get("name") or ""))
+                if created_account:
+                    result["mailboxes_created"] += 1
+                    existing_accounts.add(email_address)
+            else:
+                result["already_exists"] += 1
+        except Exception as exc:
+            result["failed"] += 1
+            result["failures"].append({"email": email_address, "error": getattr(exc, "detail", {"error": type(exc).__name__})})
+            logging.getLogger("ticket-mail-admin").warning("project mailbox mail-service sync failed email=%s type=%s", email_address, type(exc).__name__)
+    sync_stalwart_catalog()
+    return result
+
+
 def dns_short(name: str, record_type: str) -> list[str]:
     try:
         result = subprocess.run(["dig", "+time=3", "+tries=1", "+short", record_type, name],
@@ -984,6 +1060,16 @@ def sync_mail_service(request: Request):
     logging.getLogger("ticket-audit").info("mail service synced actor=%s domains=%s mailboxes=%s ip=%s",
         context["username"], len(domains), len(accounts), request.client.host if request.client else "unknown")
     return {"ok": True, "domains": len(domains), "mailboxes": len(accounts), "synced_at": now()}
+
+
+@app.post("/api/admin/mail-service/sync-project-mailboxes")
+def sync_project_mail_service(request: Request, limit: Optional[int] = None):
+    context = require_admin(request)
+    result = sync_project_mailboxes_to_mail_service(limit)
+    logging.getLogger("ticket-audit").info("project mailboxes ensured in mail service actor=%s checked=%s domains_created=%s mailboxes_created=%s failed=%s ip=%s",
+        context["username"], result["checked"], result["domains_created"], result["mailboxes_created"],
+        result["failed"], request.client.host if request.client else "unknown")
+    return {"ok": True, **result, "synced_at": now()}
 
 
 @app.post("/api/admin/mail-service/domains")

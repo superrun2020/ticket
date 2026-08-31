@@ -233,6 +233,7 @@ class MailWorker:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.config_cursor = 0
+        self.last_project_mail_service_sync = 0.0
 
     def start(self):
         if os.getenv("TICKET_MAIL_WORKER", "1") == "0" or self.thread:
@@ -248,6 +249,7 @@ class MailWorker:
     def _loop(self):
         while not self.stop_event.is_set():
             try:
+                self._sync_project_mail_service_if_due()
                 configs = load_configs(self.root)
                 self._sync_config(configs)
                 per_cycle = max(1, int(os.getenv("TICKET_MAILBOXES_PER_CYCLE", "5")))
@@ -273,6 +275,25 @@ class MailWorker:
             except Exception:
                 log.exception("mail worker cycle failed")
             self.stop_event.wait(int(os.getenv("TICKET_MAIL_POLL_SECONDS", "30")))
+
+    def _sync_project_mail_service_if_due(self):
+        if os.getenv("TICKET_PROJECT_MAIL_SERVICE_SYNC", "1") != "1":
+            return
+        interval = max(60, int(os.getenv("TICKET_PROJECT_MAIL_SERVICE_SYNC_SECONDS", "3600")))
+        current = time.time()
+        if current - self.last_project_mail_service_sync < interval:
+            return
+        self.last_project_mail_service_sync = current
+        try:
+            from app import sync_project_mailboxes_to_mail_service
+            result = sync_project_mailboxes_to_mail_service()
+            if result.get("domains_created") or result.get("mailboxes_created") or result.get("failed"):
+                log.info("project mailbox mail-service sync checked=%s domains_created=%s mailboxes_created=%s failed=%s",
+                    result.get("checked"), result.get("domains_created"), result.get("mailboxes_created"), result.get("failed"))
+            else:
+                log.info("project mailbox mail-service sync checked=%s no changes", result.get("checked"))
+        except Exception:
+            log.exception("project mailbox mail-service sync failed")
 
     def _sync_config(self, configs):
         from app import now
