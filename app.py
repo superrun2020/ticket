@@ -55,6 +55,7 @@ INTERNAL_PROJECT_API_PREFIX = "/api/internal/projects"
 SYSTEM_SENDER_PREFIXES = ("mailer-daemon@", "postmaster@", "no-reply@", "noreply@", "bounce@", "do-not-reply@")
 mail_domain_status_cache: dict[str, tuple[float, str, dict]] = {}
 mail_tls_status_cache: tuple[float, bool] = (0.0, False)
+MAIL_PROVISION_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", "oc_abb45b64cf2f1137796a94609bf6eccd")
 
 
 def internal_api_authorized(request: Request) -> bool:
@@ -588,6 +589,10 @@ def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
                 if created_domain:
                     result["domains_created"] += 1
                     existing_domains.add(domain)
+                    send_mail_provision_notification(
+                        f"✅ 工单系统已自动创建邮件域名\n域名：{domain}\n来源：project_mailboxes\n时间：{now()}",
+                        f"mail-domain-created-{domain}",
+                    )
             if email_address not in existing_accounts:
                 password, generated_password = password_for_project_mail_service(cfg)
                 if not password:
@@ -599,12 +604,22 @@ def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
                     account = next((x for x in stalwart_list("Account") if public_stalwart_account(x)["email"] == email_address), None)
                     if account and generated_password:
                         save_project_stalwart_override(cfg, str(account["id"]), password)
+                    send_mail_provision_notification(
+                        f"✅ 工单系统已自动创建邮箱\n邮箱：{email_address}\n域名：{domain}\n工作区：{cfg.get('workspace_id') or 'geekforest'}\n来源：project_mailboxes\n时间：{now()}",
+                        f"mailbox-created-{email_address}",
+                    )
             else:
                 result["already_exists"] += 1
         except Exception as exc:
             result["failed"] += 1
-            result["failures"].append({"email": email_address, "error": getattr(exc, "detail", {"error": type(exc).__name__})})
+            error_detail = getattr(exc, "detail", {"error": type(exc).__name__})
+            result["failures"].append({"email": email_address, "error": error_detail})
             logging.getLogger("ticket-mail-admin").warning("project mailbox mail-service sync failed email=%s type=%s", email_address, type(exc).__name__)
+            error_code = error_detail.get("error", type(exc).__name__) if isinstance(error_detail, dict) else type(exc).__name__
+            send_mail_provision_notification(
+                f"❌ 工单系统自动创建邮箱失败\n邮箱：{email_address}\n域名：{domain}\n错误：{error_code}\n来源：project_mailboxes\n时间：{now()}",
+                f"mailbox-create-failed-{email_address}-{int(time.time())}",
+            )
     sync_stalwart_catalog()
     return result
 
@@ -745,6 +760,37 @@ def ensure_workspace_mailbox_tag(workspace_id: str, tag: str) -> str:
 def should_send_ticket_ack(sender_email: str) -> bool:
     value = sender_email.strip().lower()
     return bool(value and "@" in value and not any(value.startswith(prefix) for prefix in SYSTEM_SENDER_PREFIXES))
+
+
+def internal_notify_token() -> str:
+    for key in ("TICKET_NOTIFY_API_TOKEN", "CODEX_TOKEN", "OA_INTERNAL_API_TOKEN", "INTERNAL_CODEX_TOKEN"):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def send_mail_provision_notification(text: str, biz_key: str) -> bool:
+    chat_id = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", MAIL_PROVISION_NOTIFY_CHAT_ID).strip()
+    token = internal_notify_token()
+    base_url = os.getenv("TICKET_NOTIFY_API_BASE_URL", "https://auth.geekforest.ai").rstrip("/")
+    if not chat_id or not token:
+        logging.getLogger("ticket-mail-admin").info("mail provision notification skipped missing config")
+        return False
+    body = {"chatIds": [chat_id], "text": text, "bizType": "ticket_mail_provision", "bizKey": biz_key[:180]}
+    request = urllib.request.Request(
+        f"{base_url}/api/internal/feishu/message/send",
+        data=json.dumps(body, ensure_ascii=False).encode(),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "X-Request-ID": biz_key[:120]},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+        return bool(payload.get("ok", True))
+    except Exception as exc:
+        logging.getLogger("ticket-mail-admin").warning("mail provision notification failed type=%s", type(exc).__name__)
+        return False
 
 
 def ask_ai(instructions: str, text: str) -> str:
