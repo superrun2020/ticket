@@ -224,7 +224,7 @@ def load_configs(root: Path) -> list[dict]:
             with conn.cursor() as cursor:
                 cursor.execute("""SELECT id,project_code,mailbox_email,mail_host,mail_port,
                     mail_protocol,mail_encryption,mail_username,
-                    COALESCE(NULLIF(mail_password_plain,''),mail_password) AS password,
+                    NULLIF(mail_password_plain,'') AS password,
                     mail_folder,enabled FROM project_mailboxes WHERE enabled=1""")
                 rows = cursor.fetchall()
         finally:
