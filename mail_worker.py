@@ -141,6 +141,8 @@ def _project_config(row: dict) -> dict:
         "smtp_ssl": True if is_google else os.getenv("TICKET_SMTP_SSL", "1") == "1",
         "workspace_id": os.getenv("TICKET_SOURCE_WORKSPACE_ID", "geekforest"),
         "mailbox_tag": "未分类", "provider": "google" if is_google else "standard",
+        "owner_name": row.get("owner_name") or row.get("creator_name") or row.get("created_by_name") or row.get("operator_name") or "",
+        "owner_email": row.get("owner_email") or row.get("creator_email") or row.get("created_by_email") or row.get("operator_email") or "",
     }
 
 
@@ -222,10 +224,29 @@ def load_configs(root: Path) -> list[dict]:
         )
         try:
             with conn.cursor() as cursor:
-                cursor.execute("""SELECT id,project_code,mailbox_email,mail_host,mail_port,
-                    mail_protocol,mail_encryption,mail_username,
-                    NULLIF(mail_password_plain,'') AS password,
-                    mail_folder,enabled FROM project_mailboxes WHERE enabled=1""")
+                cursor.execute("SHOW COLUMNS FROM project_mailboxes")
+                columns = {str(row["Field"]) for row in cursor.fetchall()}
+                optional_owner_fields = [
+                    "owner_name", "owner_email", "creator_name", "creator_email",
+                    "created_by_name", "created_by_email", "operator_name", "operator_email",
+                ]
+                optional_selects = [f"m.{field}" for field in optional_owner_fields if field in columns]
+                join_sql = ""
+                cursor.execute("SHOW TABLES LIKE 'project_projects'")
+                if cursor.fetchone():
+                    cursor.execute("SHOW COLUMNS FROM project_projects")
+                    project_columns = {str(row["Field"]) for row in cursor.fetchall()}
+                    if "project_code" in project_columns:
+                        join_sql = " LEFT JOIN project_projects p ON p.project_code=m.project_code"
+                        if "owner_name" in project_columns and "owner_name" not in columns:
+                            optional_selects.append("p.owner_name AS owner_name")
+                        if "owner_email" in project_columns and "owner_email" not in columns:
+                            optional_selects.append("p.owner_email AS owner_email")
+                optional_sql = ("," + ",".join(optional_selects)) if optional_selects else ""
+                cursor.execute(f"""SELECT m.id,m.project_code,m.mailbox_email,m.mail_host,m.mail_port,
+                    m.mail_protocol,m.mail_encryption,m.mail_username,
+                    NULLIF(m.mail_password_plain,'') AS password,
+                    m.mail_folder,m.enabled{optional_sql} FROM project_mailboxes m{join_sql} WHERE m.enabled=1""")
                 rows = cursor.fetchall()
         finally:
             conn.close()

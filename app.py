@@ -56,6 +56,7 @@ SYSTEM_SENDER_PREFIXES = ("mailer-daemon@", "postmaster@", "no-reply@", "noreply
 mail_domain_status_cache: dict[str, tuple[float, str, dict]] = {}
 mail_tls_status_cache: tuple[float, bool] = (0.0, False)
 MAIL_PROVISION_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", "oc_abb45b64cf2f1137796a94609bf6eccd")
+MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID", "oc_39c1db188aac4caabd7e22367984f7be")
 
 
 def internal_api_authorized(request: Request) -> bool:
@@ -608,6 +609,7 @@ def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
                         f"✅ 工单系统已自动创建邮箱\n邮箱：{email_address}\n域名：{domain}\n工作区：{cfg.get('workspace_id') or 'geekforest'}\n来源：project_mailboxes\n时间：{now()}",
                         f"mailbox-created-{email_address}",
                     )
+                    notify_mailbox_owner_created(cfg, email_address, domain)
             else:
                 result["already_exists"] += 1
         except Exception as exc:
@@ -790,6 +792,79 @@ def send_mail_provision_notification(text: str, biz_key: str) -> bool:
         return bool(payload.get("ok", True))
     except Exception as exc:
         logging.getLogger("ticket-mail-admin").warning("mail provision notification failed type=%s", type(exc).__name__)
+        return False
+
+
+def internal_notify_request(path: str, body: dict, biz_key: str, timeout: int = 12) -> Optional[dict]:
+    token = internal_notify_token()
+    base_url = os.getenv("TICKET_NOTIFY_API_BASE_URL", "https://auth.geekforest.ai").rstrip("/")
+    if not token:
+        return None
+    request = urllib.request.Request(
+        f"{base_url}{path}",
+        data=json.dumps(body, ensure_ascii=False).encode(),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "X-Request-ID": biz_key[:120]},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def lookup_feishu_employee(owner_email: str = "", owner_name: str = "") -> Optional[dict]:
+    owner_email = str(owner_email or "").strip().lower()
+    owner_name = str(owner_name or "").strip()
+    if not owner_email and not owner_name:
+        return None
+    try:
+        payload = internal_notify_request(
+            "/api/internal/feishu/user/lookup",
+            {"email": owner_email, "name": owner_name},
+            f"mailbox-owner-lookup-{owner_email or owner_name}",
+            timeout=10,
+        )
+        employee = payload.get("employee") if isinstance(payload, dict) else None
+        return employee if isinstance(employee, dict) and (employee.get("feishuUserId") or employee.get("feishuOpenId")) else None
+    except Exception as exc:
+        logging.getLogger("ticket-mail-admin").warning("mail provision owner lookup failed type=%s", type(exc).__name__)
+        return None
+
+
+def feishu_at_text(employee: dict) -> str:
+    name = str(employee.get("name") or employee.get("email") or "负责人").strip()
+    user_id = str(employee.get("feishuUserId") or "").strip()
+    if user_id:
+        return f'<at user_id="{user_id}">{name}</at>'
+    return name
+
+
+def notify_mailbox_owner_created(cfg: dict, email_address: str, domain: str) -> bool:
+    chat_id = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID", MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID).strip()
+    if not chat_id:
+        return False
+    owner_email = str(cfg.get("owner_email") or "").strip()
+    owner_name = str(cfg.get("owner_name") or "").strip()
+    employee = lookup_feishu_employee(owner_email, owner_name)
+    if not employee:
+        logging.getLogger("ticket-mail-admin").info("mail provision owner notification skipped unmatched owner email_present=%s name_present=%s", bool(owner_email), bool(owner_name))
+        return False
+    mention = feishu_at_text(employee)
+    text = (
+        "✅ 邮箱已创建成功\n"
+        f"{mention}\n"
+        f"邮箱：{email_address}\n"
+        f"域名：{domain}\n"
+        f"项目：{cfg.get('name') or '-'}\n"
+        "已接入工单系统。"
+    )
+    try:
+        payload = internal_notify_request(
+            "/api/internal/feishu/message/send",
+            {"chatIds": [chat_id], "text": text, "bizType": "ticket_mail_provision_owner", "bizKey": f"mailbox-owner-created-{email_address}"},
+            f"mailbox-owner-created-{email_address}",
+        )
+        return bool(payload and payload.get("ok", True))
+    except Exception as exc:
+        logging.getLogger("ticket-mail-admin").warning("mail provision owner notification failed type=%s", type(exc).__name__)
         return False
 
 
