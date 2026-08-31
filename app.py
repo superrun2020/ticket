@@ -800,11 +800,14 @@ def internal_notify_request(path: str, body: dict, biz_key: str, timeout: int = 
     base_url = os.getenv("TICKET_NOTIFY_API_BASE_URL", "https://auth.geekforest.ai").rstrip("/")
     if not token:
         return None
+    request_id = re.sub(r"[^A-Za-z0-9_.:-]", "-", biz_key)[:120]
+    if not request_id:
+        request_id = hashlib.sha256(biz_key.encode("utf-8")).hexdigest()[:32]
     request = urllib.request.Request(
         f"{base_url}{path}",
         data=json.dumps(body, ensure_ascii=False).encode(),
         method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "X-Request-ID": biz_key[:120]},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "X-Request-ID": request_id},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
