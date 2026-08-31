@@ -533,6 +533,13 @@ def create_stalwart_account_if_missing(email_address: str, password: str, displa
     return created, True
 
 
+def verified_stalwart_account(email_address: str) -> Optional[dict]:
+    email_address = str(email_address or "").strip().lower()
+    if not email_address:
+        return None
+    return next((x for x in stalwart_list("Account") if public_stalwart_account(x)["email"] == email_address), None)
+
+
 def password_for_project_mail_service(cfg: dict) -> tuple[str, bool]:
     password = str(cfg.get("password") or "")
     if 8 <= len(password) <= 128:
@@ -600,14 +607,16 @@ def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
                     raise HTTPException(422, detail={"error": "MAILBOX_PASSWORD_MISSING", "email": email_address})
                 _, created_account = create_stalwart_account_if_missing(email_address, password, str(cfg.get("name") or ""))
                 if created_account:
+                    account = verified_stalwart_account(email_address)
+                    if not account:
+                        raise HTTPException(502, detail={"error": "MAILBOX_NOT_EFFECTIVE", "email": email_address})
                     result["mailboxes_created"] += 1
                     existing_accounts.add(email_address)
-                    account = next((x for x in stalwart_list("Account") if public_stalwart_account(x)["email"] == email_address), None)
                     if account and generated_password:
                         save_project_stalwart_override(cfg, str(account["id"]), password)
                     send_mail_provision_notification(
-                        f"✅ 工单系统已自动创建邮箱\n邮箱：{email_address}\n域名：{domain}\n工作区：{cfg.get('workspace_id') or 'geekforest'}\n来源：project_mailboxes\n时间：{now()}",
-                        f"mailbox-created-{email_address}",
+                        f"✅ 工单系统邮箱已创建并生效\n邮箱：{email_address}\n域名：{domain}\n工作区：{cfg.get('workspace_id') or 'geekforest'}\n来源：project_mailboxes\n时间：{now()}",
+                        f"mailbox-effective-{email_address}",
                     )
                     notify_mailbox_owner_created(cfg, email_address, domain)
             else:
@@ -852,7 +861,7 @@ def notify_mailbox_owner_created(cfg: dict, email_address: str, domain: str) -> 
         return False
     mention = feishu_at_text(employee)
     text = (
-        "✅ 邮箱已创建成功\n"
+        "✅ 邮箱已创建并生效\n"
         f"{mention}\n"
         f"邮箱：{email_address}\n"
         f"域名：{domain}\n"
