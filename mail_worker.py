@@ -237,7 +237,11 @@ def load_configs(root: Path) -> list[dict]:
                     cursor.execute("SHOW COLUMNS FROM project_projects")
                     project_columns = {str(row["Field"]) for row in cursor.fetchall()}
                     if "project_code" in project_columns:
-                        join_sql = " LEFT JOIN project_projects p ON p.project_code=m.project_code"
+                        join_sql = (
+                            " LEFT JOIN project_projects p ON "
+                            "CONVERT(p.project_code USING utf8mb4) COLLATE utf8mb4_unicode_ci="
+                            "CONVERT(m.project_code USING utf8mb4) COLLATE utf8mb4_unicode_ci"
+                        )
                         if "owner_name" in project_columns and "owner_name" not in columns:
                             optional_selects.append("p.owner_name AS owner_name")
                         if "owner_email" in project_columns and "owner_email" not in columns:
