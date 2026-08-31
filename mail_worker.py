@@ -196,6 +196,17 @@ def _managed_stalwart_configs(root: Path) -> list[dict]:
         "mailbox_tag": row["mailbox_tag"], "provider": "stalwart", "sync_existing_on_first_run": True} for row in rows]
 
 
+def _dedupe_configs(configs: list[dict]) -> list[dict]:
+    by_id: dict[str, dict] = {}
+    order: list[str] = []
+    for cfg in configs:
+        cfg_id = cfg["id"]
+        if cfg_id not in by_id:
+            order.append(cfg_id)
+        by_id[cfg_id] = cfg
+    return [by_id[cfg_id] for cfg_id in order]
+
+
 def load_configs(root: Path) -> list[dict]:
     if os.getenv("TICKET_MAILBOX_SOURCE") == "mysql":
         import pymysql
@@ -219,12 +230,12 @@ def load_configs(root: Path) -> list[dict]:
         finally:
             conn.close()
         configs = [_project_config(r) for r in rows]
-        return configs + _managed_google_configs(root) + _managed_stalwart_configs(root) + _eddy_configs()
+        return _dedupe_configs(configs + _managed_google_configs(root) + _managed_stalwart_configs(root) + _eddy_configs())
     path = Path(os.getenv("TICKET_MAILBOXES_FILE", root / "mailboxes.json"))
     if not path.exists():
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
-    return [x for x in data if x.get("enabled", True)] + _managed_google_configs(root) + _managed_stalwart_configs(root) + _eddy_configs()
+    return _dedupe_configs([x for x in data if x.get("enabled", True)] + _managed_google_configs(root) + _managed_stalwart_configs(root) + _eddy_configs())
 
 
 class MailWorker:

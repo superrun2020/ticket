@@ -531,6 +531,38 @@ def create_stalwart_account_if_missing(email_address: str, password: str, displa
     return created, True
 
 
+def password_for_project_mail_service(cfg: dict) -> tuple[str, bool]:
+    password = str(cfg.get("password") or "")
+    if 8 <= len(password) <= 128:
+        return password, False
+    username = str(cfg.get("email", "")).split("@", 1)[0].lower()
+    fallback = f"pass@{re.sub(r'[^a-z0-9]+', '', username)[:48] or 'mailbox'}2026"
+    return fallback, True
+
+
+def save_project_stalwart_override(cfg: dict, account_id: str, password: str, created_by: str = "mail-service-sync") -> None:
+    ts = now()
+    email_address = str(cfg["email"]).strip().lower()
+    mailbox_id = str(cfg["id"])
+    display_name = str(cfg.get("name") or email_address.split("@", 1)[0])
+    mailbox_tag = cfg.get("mailbox_tag") or "未分类"
+    workspace_id = cfg.get("workspace_id") or "geekforest"
+    encrypted = secret_box().encrypt(password.encode()).decode()
+    with db() as conn:
+        conn.execute("""INSERT INTO managed_stalwart_mailboxes
+            (id,account_id,mailbox_email,display_name,password_ciphertext,mailbox_tag,workspace_id,enabled,created_by,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,1,?,?,?)
+            ON CONFLICT(mailbox_email) DO UPDATE SET account_id=excluded.account_id,display_name=excluded.display_name,
+            password_ciphertext=excluded.password_ciphertext,mailbox_tag=excluded.mailbox_tag,workspace_id=excluded.workspace_id,
+            enabled=1,updated_at=excluded.updated_at""",
+            (mailbox_id, account_id, email_address, display_name, encrypted, mailbox_tag, workspace_id, created_by, ts, ts))
+        conn.execute("""INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag)
+            VALUES(?,?,?,'#6558d3',?,1,?,?)
+            ON CONFLICT(id) DO UPDATE SET name=excluded.name,email=excluded.email,enabled=1,workspace_id=excluded.workspace_id,mailbox_tag=excluded.mailbox_tag""",
+            (mailbox_id, display_name, email_address, ts, workspace_id, mailbox_tag))
+        conn.execute("INSERT OR IGNORE INTO mailbox_sync(mailbox_id,last_uid,updated_at) VALUES(?,0,?)", (mailbox_id, ts))
+
+
 def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
     """Ensure project source mailboxes also exist in the new Stalwart/Mail2 service."""
     from mail_worker import load_configs
@@ -557,13 +589,16 @@ def sync_project_mailboxes_to_mail_service(limit: Optional[int] = None) -> dict:
                     result["domains_created"] += 1
                     existing_domains.add(domain)
             if email_address not in existing_accounts:
-                password = str(cfg.get("password") or "")
+                password, generated_password = password_for_project_mail_service(cfg)
                 if not password:
                     raise HTTPException(422, detail={"error": "MAILBOX_PASSWORD_MISSING", "email": email_address})
                 _, created_account = create_stalwart_account_if_missing(email_address, password, str(cfg.get("name") or ""))
                 if created_account:
                     result["mailboxes_created"] += 1
                     existing_accounts.add(email_address)
+                    account = next((x for x in stalwart_list("Account") if public_stalwart_account(x)["email"] == email_address), None)
+                    if account and generated_password:
+                        save_project_stalwart_override(cfg, str(account["id"]), password)
             else:
                 result["already_exists"] += 1
         except Exception as exc:
