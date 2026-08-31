@@ -536,7 +536,7 @@ def password_for_project_mail_service(cfg: dict) -> tuple[str, bool]:
     if 8 <= len(password) <= 128:
         return password, False
     username = str(cfg.get("email", "")).split("@", 1)[0].lower()
-    fallback = f"pass@{re.sub(r'[^a-z0-9]+', '', username)[:48] or 'mailbox'}2026"
+    fallback = f"pass@{username[:80] or 'mailbox'}1"
     return fallback, True
 
 
