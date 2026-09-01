@@ -785,7 +785,7 @@ def should_send_ticket_ack(sender_email: str) -> bool:
 
 def parse_recipient_list(raw: str) -> list[str]:
     text = str(raw or "").strip()
-    if not text:
+    if not text or text.lower() in {"null", "undefined", "none"}:
         return []
     normalized = re.sub(r"[，；、]+", ",", text)
     normalized = re.sub(r"[\r\n]+", ",", normalized)
