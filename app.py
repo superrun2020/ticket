@@ -17,6 +17,7 @@ import urllib.request
 import urllib.parse
 import sqlite3
 import uuid
+from email.utils import getaddresses
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -780,6 +781,25 @@ def ensure_workspace_mailbox_tag(workspace_id: str, tag: str) -> str:
 def should_send_ticket_ack(sender_email: str) -> bool:
     value = sender_email.strip().lower()
     return bool(value and "@" in value and not any(value.startswith(prefix) for prefix in SYSTEM_SENDER_PREFIXES))
+
+
+def parse_recipient_list(raw: str) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    normalized = re.sub(r"[，；、]+", ",", text)
+    normalized = re.sub(r"[\r\n]+", ",", normalized)
+    normalized = re.sub(r"(?<=>)\s+(?=[^,<>\s]+@)", ",", normalized)
+    normalized = re.sub(r"(?<=[^,<>\s])\s+(?=[^,<>\s]+@[^,<>\s]+)", ",", normalized)
+    values = []
+    for _, address in getaddresses([normalized]):
+        value = address.strip().lower()
+        if not value:
+            continue
+        if not re.fullmatch(r"[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+", value):
+            raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value[:160]})
+        values.append(value)
+    return list(dict.fromkeys(values))
 
 
 def internal_notify_token() -> str:
@@ -1635,20 +1655,11 @@ async def reply_with_attachments(ticket_id: str, request: Request, body: str = F
 def compose_mail(payload: ComposeMailIn, request: Request):
     context = current_context(request)
     subject, body, ts = payload.subject.strip(), payload.body.strip(), now()
-    def parse_recipients(raw: str) -> list[str]:
-        values = [part.strip().lower() for part in re.split(r"[,;\\n]+", raw) if part.strip()]
-        result = []
-        for value in values:
-            try:
-                result.append(str(EmailStr(value)))
-            except Exception:
-                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value})
-        return list(dict.fromkeys(result))
-    recipients = parse_recipients(payload.to_email)
+    recipients = parse_recipient_list(payload.to_email)
     if not recipients:
         raise HTTPException(422, detail={"error": "RECIPIENT_REQUIRED"})
     recipient = recipients[0]
-    cc_emails, bcc_emails = parse_recipients(payload.cc), parse_recipients(payload.bcc)
+    cc_emails, bcc_emails = parse_recipient_list(payload.cc), parse_recipient_list(payload.bcc)
     if not subject or not body:
         raise HTTPException(422, detail={"error": "SUBJECT_AND_BODY_REQUIRED"})
     with db() as conn:
@@ -1684,20 +1695,11 @@ async def compose_mail_with_attachments(request: Request, mailbox_id: str = Form
                                         body: str = Form(...), files: list[UploadFile] = File(default=[])):
     context = current_context(request)
     subject, body, ts = subject.strip(), body.strip(), now()
-    def parse_recipients(raw: str) -> list[str]:
-        values = [part.strip().lower() for part in re.split(r"[,;\\n]+", raw) if part.strip()]
-        result = []
-        for value in values:
-            try:
-                result.append(str(EmailStr(value)))
-            except Exception:
-                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value})
-        return list(dict.fromkeys(result))
-    recipients = parse_recipients(to_email)
+    recipients = parse_recipient_list(to_email)
     if not recipients:
         raise HTTPException(422, detail={"error": "RECIPIENT_REQUIRED"})
     recipient = recipients[0]
-    cc_emails, bcc_emails = parse_recipients(cc), parse_recipients(bcc)
+    cc_emails, bcc_emails = parse_recipient_list(cc), parse_recipient_list(bcc)
     if not subject or not body:
         raise HTTPException(422, detail={"error": "SUBJECT_AND_BODY_REQUIRED"})
     with db() as conn:
