@@ -58,6 +58,9 @@ mail_domain_status_cache: dict[str, tuple[float, str, dict]] = {}
 mail_tls_status_cache: tuple[float, bool] = (0.0, False)
 MAIL_PROVISION_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", "oc_abb45b64cf2f1137796a94609bf6eccd")
 MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID", "oc_39c1db188aac4caabd7e22367984f7be")
+ACK_DISABLED_WORKSPACES = {
+    value.strip() for value in os.getenv("TICKET_ACK_DISABLED_WORKSPACES", "bounder").split(",") if value.strip()
+}
 
 
 def internal_api_authorized(request: Request) -> bool:
@@ -781,6 +784,10 @@ def ensure_workspace_mailbox_tag(workspace_id: str, tag: str) -> str:
 def should_send_ticket_ack(sender_email: str) -> bool:
     value = sender_email.strip().lower()
     return bool(value and "@" in value and not any(value.startswith(prefix) for prefix in SYSTEM_SENDER_PREFIXES))
+
+
+def should_send_workspace_ticket_ack(workspace_id: str, sender_email: str) -> bool:
+    return str(workspace_id or "").strip() not in ACK_DISABLED_WORKSPACES and should_send_ticket_ack(sender_email)
 
 
 def parse_recipient_list(raw: str) -> list[str]:
@@ -1776,7 +1783,8 @@ def receive_mail(mail: IncomingMail):
             existing = conn.execute("SELECT ticket_id FROM messages WHERE provider_message_id=?", (mail.provider_message_id,)).fetchone()
             if existing:
                 return {"ok": True, "ticket_id": existing["ticket_id"], "created": False, "duplicate": True}
-        if not conn.execute("SELECT 1 FROM mailboxes WHERE id=?", (mail.mailbox_id,)).fetchone():
+        mailbox = conn.execute("SELECT id,workspace_id FROM mailboxes WHERE id=?", (mail.mailbox_id,)).fetchone()
+        if not mailbox:
             raise HTTPException(400, "Unknown mailbox")
         ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (mail.in_reply_to_ticket,)).fetchone() if mail.in_reply_to_ticket and not mail.historical else None
         if ticket:
@@ -1795,7 +1803,7 @@ def receive_mail(mail: IncomingMail):
                     direction="inbound", filename=item.filename, content_type=item.content_type, data=data, created_at=ts)
             except (ValueError, HTTPException):
                 logging.getLogger("ticket-mail").warning("skip invalid inbound attachment ticket=%s filename=%s", ticket_id, item.filename)
-        send_ack = not ticket and not mail.historical and should_send_ticket_ack(str(mail.sender_email))
+        send_ack = not ticket and not mail.historical and should_send_workspace_ticket_ack(mailbox["workspace_id"], str(mail.sender_email))
         if send_ack:
             ack = (
                 f"Hello {mail.sender_name},\n\n"
@@ -1805,7 +1813,7 @@ def receive_mail(mail: IncomingMail):
                 "GeekForest Support"
             )
             conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header) VALUES(?,?,?,?,?,'queued',?,?,?,?)", (str(uuid.uuid4()), ticket_id, str(mail.sender_email), f"[{ticket_id}] Ticket created: {mail.subject}", ack, ts, ts, mail.internet_message_id, mail.references_header or mail.internet_message_id))
-    return {"ok": True, "ticket_id": ticket_id, "created": ticket is None, "confirmation_email": "queued" if not ticket and not mail.historical and should_send_ticket_ack(str(mail.sender_email)) else None}
+    return {"ok": True, "ticket_id": ticket_id, "created": ticket is None, "confirmation_email": "queued" if send_ack else None}
 
 
 @app.get("/api/outbox")
