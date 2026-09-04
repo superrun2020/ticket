@@ -790,6 +790,10 @@ def should_send_workspace_ticket_ack(workspace_id: str, sender_email: str) -> bo
     return str(workspace_id or "").strip() not in ACK_DISABLED_WORKSPACES and should_send_ticket_ack(sender_email)
 
 
+def mailbox_can_auto_create_ticket(mailbox: sqlite3.Row) -> bool:
+    return str(mailbox["id"] or "").startswith("project-")
+
+
 def parse_recipient_list(raw: str) -> list[str]:
     text = str(raw or "").strip()
     if not text or text.lower() in {"null", "undefined", "none"}:
@@ -1787,6 +1791,9 @@ def receive_mail(mail: IncomingMail):
         if not mailbox:
             raise HTTPException(400, "Unknown mailbox")
         ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (mail.in_reply_to_ticket,)).fetchone() if mail.in_reply_to_ticket and not mail.historical else None
+        if not ticket and not mailbox_can_auto_create_ticket(mailbox):
+            logging.getLogger("ticket-mail").info("skip auto ticket creation for unbound mailbox=%s workspace=%s", mailbox["id"], mailbox["workspace_id"])
+            return {"ok": True, "ticket_id": None, "created": False, "skipped": True, "reason": "MAILBOX_NOT_PROJECT_BOUND", "confirmation_email": None}
         if ticket:
             ticket_id = ticket["id"]
             conn.execute("UPDATE tickets SET status='open',ai_category_status='pending',updated_at=? WHERE id=?", (ts, ticket_id))
