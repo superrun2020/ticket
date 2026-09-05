@@ -61,6 +61,9 @@ MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOT
 ACK_DISABLED_WORKSPACES = {
     value.strip() for value in os.getenv("TICKET_ACK_DISABLED_WORKSPACES", "bounder").split(",") if value.strip()
 }
+AUTO_CREATE_MAILBOXES = {
+    value.strip().lower() for value in os.getenv("TICKET_AUTO_CREATE_MAILBOXES", "").split(",") if value.strip()
+}
 
 
 def internal_api_authorized(request: Request) -> bool:
@@ -791,7 +794,9 @@ def should_send_workspace_ticket_ack(workspace_id: str, sender_email: str) -> bo
 
 
 def mailbox_can_auto_create_ticket(mailbox: sqlite3.Row) -> bool:
-    return str(mailbox["id"] or "").startswith("project-")
+    mailbox_id = str(mailbox["id"] or "")
+    mailbox_email = str(mailbox["email"] or "").strip().lower()
+    return mailbox_id.startswith("project-") or mailbox_id.lower() in AUTO_CREATE_MAILBOXES or mailbox_email in AUTO_CREATE_MAILBOXES
 
 
 def parse_recipient_list(raw: str) -> list[str]:
@@ -1787,7 +1792,7 @@ def receive_mail(mail: IncomingMail):
             existing = conn.execute("SELECT ticket_id FROM messages WHERE provider_message_id=?", (mail.provider_message_id,)).fetchone()
             if existing:
                 return {"ok": True, "ticket_id": existing["ticket_id"], "created": False, "duplicate": True}
-        mailbox = conn.execute("SELECT id,workspace_id FROM mailboxes WHERE id=?", (mail.mailbox_id,)).fetchone()
+        mailbox = conn.execute("SELECT id,email,workspace_id FROM mailboxes WHERE id=?", (mail.mailbox_id,)).fetchone()
         if not mailbox:
             raise HTTPException(400, "Unknown mailbox")
         ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (mail.in_reply_to_ticket,)).fetchone() if mail.in_reply_to_ticket and not mail.historical else None
