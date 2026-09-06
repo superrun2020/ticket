@@ -115,11 +115,19 @@ def _eddy_configs() -> list[dict]:
         conn.close()
     key = base64.urlsafe_b64encode(hashlib.sha256(os.environ["TICKET_SESSION_SECRET"].encode()).digest())
     box = Fernet(key)
+    workspace_by_domain = {
+        item.split("=", 1)[0].strip().lower(): item.split("=", 1)[1].strip()
+        for item in os.getenv("EDDY_SOURCE_WORKSPACE_DOMAIN_MAP", "familychronica.com=familychronica").split(",")
+        if "=" in item and item.split("=", 1)[0].strip() and item.split("=", 1)[1].strip()
+    }
+    def workspace_for(email_address: str) -> str:
+        domain = (email_address or "").rsplit("@", 1)[-1].lower()
+        return workspace_by_domain.get(domain, "eddy-personal")
     return [{"id": f"eddy-{r['id']}", "name": r["display_name"] or r["project_code"], "email": r["mailbox_email"],
         "color": "#1b9aaa", "imap_host": r["imap_host"], "imap_port": r["imap_port"], "imap_folder": r["mail_folder"],
         "username": r["imap_username"], "smtp_username": r["smtp_username"], "password": box.decrypt(r["password_ciphertext"].encode()).decode(),
         "smtp_host": r["smtp_host"], "smtp_port": r["smtp_port"], "smtp_ssl": r["smtp_encryption"] == "ssl",
-        "workspace_id": "eddy-personal", "mailbox_tag": r["mailbox_tag"] or "未分类"} for r in rows]
+        "workspace_id": workspace_for(r["mailbox_email"]), "mailbox_tag": r["mailbox_tag"] or "未分类"} for r in rows]
 
 
 def _project_config(row: dict) -> dict:
