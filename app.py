@@ -46,8 +46,8 @@ SESSION_SECRET = os.getenv("TICKET_SESSION_SECRET", "development-only-change-me"
 SESSION_TTL = 12 * 60 * 60
 login_attempts: dict[str, list[float]] = {}
 DEFAULT_WORKSPACE_ID = "geekforest"
-MAILBOX_TAGS = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "未分类")
-AI_CATEGORIES = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "疑似垃圾邮件", "无需回复", "其他", "待分类")
+MAILBOX_TAGS = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "谷歌AdMob专区", "未分类")
+AI_CATEGORIES = ("PID邮箱", "NOC-ASN邮箱", "产品邮箱", "网盟邮箱", "谷歌AdMob专区", "疑似垃圾邮件", "无需回复", "其他", "待分类")
 WORKSPACE_MAILBOX_TAGS = {
     "gcy": ("PID邮箱", "网盟邮箱"),
 }
@@ -862,7 +862,7 @@ def should_send_workspace_ticket_ack(workspace_id: str, sender_email: str) -> bo
 def mailbox_can_auto_create_ticket(mailbox: sqlite3.Row) -> bool:
     mailbox_id = str(mailbox["id"] or "")
     mailbox_email = str(mailbox["email"] or "").strip().lower()
-    return mailbox_id.startswith("project-") or mailbox_id == "telegram" or mailbox_id.lower() in AUTO_CREATE_MAILBOXES or mailbox_email in AUTO_CREATE_MAILBOXES
+    return mailbox_id.startswith("project-") or mailbox_id in {"telegram", "google-admob"} or mailbox_id.lower() in AUTO_CREATE_MAILBOXES or mailbox_email in AUTO_CREATE_MAILBOXES
 
 
 def parse_recipient_list(raw: str) -> list[str]:
@@ -1613,6 +1613,7 @@ class IncomingMail(BaseModel):
     internet_message_id: Optional[str] = Field(default=None, max_length=1000)
     references_header: Optional[str] = Field(default=None, max_length=4000)
     historical: bool = False
+    received_at: Optional[str] = Field(default=None, max_length=40)
     attachments: list[IncomingAttachment] = Field(default_factory=list)
 
 
@@ -1966,7 +1967,7 @@ def update_ticket(ticket_id: str, changes: dict, request: Request):
 @app.post("/api/mail/incoming")
 def receive_mail(mail: IncomingMail):
     """Idempotent normalized-mail entry point, shared by webhook and IMAP polling."""
-    ts = now()
+    ts = mail.received_at or now()
     with db() as conn:
         if mail.provider_message_id:
             existing = conn.execute("SELECT ticket_id FROM messages WHERE provider_message_id=?", (mail.provider_message_id,)).fetchone()
