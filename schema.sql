@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS mailbox_sync (
   last_backfill_at TEXT, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS app_settings (
-  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL, is_secret INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS managed_google_mailboxes (
   id TEXT PRIMARY KEY, project_code TEXT NOT NULL, mailbox_email TEXT NOT NULL UNIQUE,

@@ -11,6 +11,7 @@ import secrets
 import socket
 import ssl
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -38,6 +39,7 @@ MAX_ATTACHMENT_BYTES = int(os.getenv("TICKET_MAX_ATTACHMENT_BYTES", str(20 * 102
 MAX_ATTACHMENTS_PER_MESSAGE = int(os.getenv("TICKET_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
 app = FastAPI(title="PostPilot Ticket Desk")
 worker = None
+telegram_bridge = None
 LOGIN_USER = os.getenv("TICKET_LOGIN_USER", "admin")
 LOGIN_PASSWORD = os.getenv("TICKET_LOGIN_PASSWORD", "")
 SESSION_SECRET = os.getenv("TICKET_SESSION_SECRET", "development-only-change-me")
@@ -128,7 +130,7 @@ def password_matches(password: str, stored: str) -> bool:
 
 @app.middleware("http")
 async def require_login(request: Request, call_next):
-    if request.url.path.startswith(INTERNAL_PROJECT_API_PREFIX):
+    if request.url.path.startswith(INTERNAL_PROJECT_API_PREFIX) or request.url.path == "/api/integrations/telegram/incoming":
         if internal_api_authorized(request):
             return await call_next(request)
         return JSONResponse({"ok": False, "error": "INVALID_API_TOKEN"}, status_code=401)
@@ -265,6 +267,7 @@ def init_db() -> None:
             "outbox": [("updated_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("internet_message_id", "TEXT"), ("in_reply_to", "TEXT"), ("references_header", "TEXT"), ("to_emails", "TEXT"), ("cc_emails", "TEXT"), ("bcc_emails", "TEXT"), ("message_id", "TEXT"), ("tracking_token", "TEXT"), ("delivered_at", "TEXT"), ("opened_at", "TEXT"), ("open_count", "INTEGER NOT NULL DEFAULT 0")],
             "mailbox_sync": [("backfill_active", "INTEGER NOT NULL DEFAULT 0"), ("backfill_target_uid", "INTEGER"), ("last_backfill_at", "TEXT")],
             "tickets": [("ai_category", "TEXT NOT NULL DEFAULT '待分类'"), ("ai_category_status", "TEXT NOT NULL DEFAULT 'pending'"), ("ai_category_confidence", "REAL"), ("ai_category_reason", "TEXT"), ("ai_category_source", "TEXT NOT NULL DEFAULT 'ai'"), ("ai_classified_at", "TEXT")],
+            "app_settings": [("is_secret", "INTEGER NOT NULL DEFAULT 0")],
         }
         for table, columns in migrations.items():
             existing = {x[1] for x in conn.execute(f"PRAGMA table_info({table})")}
@@ -345,6 +348,8 @@ def startup() -> None:
 def shutdown() -> None:
     if worker:
         worker.stop()
+    if telegram_bridge:
+        telegram_bridge.stop()
 
 
 class ReplyIn(BaseModel):
@@ -381,6 +386,15 @@ class AiSettingsIn(BaseModel):
     provider: str = Field(pattern="^(deepseek|openai)$")
     model: str = Field(min_length=1, max_length=100)
     api_key: Optional[str] = Field(default=None, min_length=10, max_length=500)
+
+
+class TelegramSettingsIn(BaseModel):
+    enabled: bool = False
+    bot_token: Optional[str] = Field(default=None, min_length=20, max_length=200)
+    proxy_url: Optional[str] = Field(default="", max_length=300)
+    allowed_chat_ids: Optional[str] = Field(default="", max_length=1000)
+    workspace_id: str = Field(default="geekforest", min_length=1, max_length=100)
+    poll_seconds: int = Field(default=5, ge=2, le=120)
 
 
 class WorkspaceSwitchIn(BaseModel):
@@ -738,9 +752,61 @@ def domain_mail_status(domain: dict, tls_ready: bool) -> dict:
     return result
 
 
-def get_ai_config() -> dict:
+def get_app_settings(prefix: str) -> dict:
     with db() as conn:
-        values = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM app_settings WHERE key LIKE 'ai_%'")}
+        return {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM app_settings WHERE key LIKE ?", (f"{prefix}%",))}
+
+
+def save_app_settings(values: dict[str, str], secret_keys: set[str] | None = None) -> None:
+    ts = now()
+    secret_keys = secret_keys or set()
+    with db() as conn:
+        for key, value in values.items():
+            conn.execute("""INSERT INTO app_settings(key,value,updated_at,is_secret) VALUES(?,?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,is_secret=excluded.is_secret""",
+                (key, value, ts, 1 if key in secret_keys else 0))
+
+
+def delete_app_setting(key: str) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM app_settings WHERE key=?", (key,))
+
+
+def ensure_telegram_mailbox(workspace_id: str = "geekforest") -> None:
+    ts = now()
+    with db() as conn:
+        conn.execute("""INSERT INTO mailboxes(id,name,email,color,created_at,enabled,workspace_id,mailbox_tag)
+            VALUES('telegram','Telegram','telegram@ticket.local','#229ED9',?,1,?,'未分类')
+            ON CONFLICT(id) DO UPDATE SET enabled=1,workspace_id=excluded.workspace_id""", (ts, workspace_id))
+
+
+def get_telegram_config(include_token: bool = False) -> dict:
+    values = get_app_settings("telegram_")
+    encrypted = values.get("telegram_bot_token")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if encrypted:
+        try:
+            token = secret_box().decrypt(encrypted.encode()).decode()
+        except InvalidToken:
+            logging.getLogger("ticket-telegram").error("Telegram bot token cannot be decrypted")
+            token = ""
+    config = {
+        "enabled": values.get("telegram_enabled", os.getenv("TELEGRAM_BRIDGE_ENABLED", "0")) == "1",
+        "bot_token_configured": bool(token),
+        "proxy_url": values.get("telegram_proxy_url", os.getenv("TELEGRAM_PROXY_URL", "")),
+        "allowed_chat_ids": values.get("telegram_allowed_chat_ids", os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")),
+        "mailbox_id": values.get("telegram_mailbox_id", "telegram"),
+        "workspace_id": values.get("telegram_workspace_id", "geekforest"),
+        "last_update_id": int(values.get("telegram_last_update_id", os.getenv("TELEGRAM_LAST_UPDATE_ID", "0")) or 0),
+        "poll_seconds": max(2, int(values.get("telegram_poll_seconds", os.getenv("TELEGRAM_POLL_SECONDS", "5")) or 5)),
+    }
+    if include_token:
+        config["bot_token"] = token
+    return config
+
+
+def get_ai_config() -> dict:
+    values = get_app_settings("ai_")
     provider = values.get("ai_provider", os.getenv("AI_PROVIDER", "deepseek"))
     model = values.get("ai_model", os.getenv("AI_MODEL", "deepseek-chat"))
     encrypted = values.get("ai_api_key")
@@ -796,7 +862,7 @@ def should_send_workspace_ticket_ack(workspace_id: str, sender_email: str) -> bo
 def mailbox_can_auto_create_ticket(mailbox: sqlite3.Row) -> bool:
     mailbox_id = str(mailbox["id"] or "")
     mailbox_email = str(mailbox["email"] or "").strip().lower()
-    return mailbox_id.startswith("project-") or mailbox_id.lower() in AUTO_CREATE_MAILBOXES or mailbox_email in AUTO_CREATE_MAILBOXES
+    return mailbox_id.startswith("project-") or mailbox_id == "telegram" or mailbox_id.lower() in AUTO_CREATE_MAILBOXES or mailbox_email in AUTO_CREATE_MAILBOXES
 
 
 def parse_recipient_list(raw: str) -> list[str]:
@@ -1366,6 +1432,33 @@ def polish(payload: AiTextIn):
     return {"ok": True, "text": ask_ai(prompt, payload.text)}
 
 
+@app.get("/api/integrations/telegram/settings")
+def telegram_settings(request: Request):
+    require_admin(request)
+    return {"ok": True, "settings": get_telegram_config(include_token=False)}
+
+
+@app.post("/api/integrations/telegram/settings")
+def save_telegram_settings(payload: TelegramSettingsIn, request: Request):
+    require_admin(request)
+    values = {
+        "telegram_enabled": "1" if payload.enabled else "0",
+        "telegram_proxy_url": (payload.proxy_url or "").strip(),
+        "telegram_allowed_chat_ids": (payload.allowed_chat_ids or "").strip(),
+        "telegram_workspace_id": payload.workspace_id.strip(),
+        "telegram_mailbox_id": "telegram",
+        "telegram_poll_seconds": str(payload.poll_seconds),
+    }
+    secret_keys = set()
+    if payload.bot_token:
+        values["telegram_bot_token"] = secret_box().encrypt(payload.bot_token.strip().encode()).decode()
+        secret_keys.add("telegram_bot_token")
+    save_app_settings(values, secret_keys)
+    ensure_telegram_mailbox(values["telegram_workspace_id"])
+    return {"ok": True, "settings": get_telegram_config(include_token=False)}
+
+
+
 @app.get("/api/ai/settings")
 def ai_settings():
     config = get_ai_config()
@@ -1430,6 +1523,85 @@ def suggest_ticket_reply(ticket_id: str, request: Request):
     return {"ok": True, "draft": draft, "language": "zh-CN", "model": config["model"]}
 
 
+class TelegramBridge:
+    def __init__(self) -> None:
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+
+    def start(self) -> None:
+        if self.thread:
+            return
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="ticket-telegram-bridge")
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+
+    def _request(self, config: dict, method: str, payload: dict) -> dict:
+        import requests
+        proxies = {}
+        if config.get("proxy_url"):
+            proxies = {"http": config["proxy_url"], "https": config["proxy_url"]}
+        response = requests.post(f"https://api.telegram.org/bot{config['bot_token']}/{method}", json=payload, proxies=proxies, timeout=35)
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise RuntimeError(data)
+        return data
+
+    def _loop(self) -> None:
+        log = logging.getLogger("ticket-telegram")
+        while not self.stop_event.is_set():
+            config = get_telegram_config(include_token=True)
+            if not config.get("enabled") or not config.get("bot_token"):
+                self.stop_event.wait(10)
+                continue
+            try:
+                self._poll_once(config)
+            except Exception:
+                log.exception("Telegram polling failed")
+                self.stop_event.wait(15)
+                continue
+            self.stop_event.wait(config["poll_seconds"])
+
+    def _poll_once(self, config: dict) -> None:
+        payload = {"timeout": 25, "allowed_updates": ["message", "edited_message"]}
+        if config["last_update_id"]:
+            payload["offset"] = config["last_update_id"] + 1
+        data = self._request(config, "getUpdates", payload)
+        allowed = {x.strip() for x in str(config.get("allowed_chat_ids") or "").split(",") if x.strip()}
+        max_update_id = config["last_update_id"]
+        for update in data.get("result", []):
+            max_update_id = max(max_update_id, int(update.get("update_id", 0)))
+            message = update.get("message") or update.get("edited_message") or {}
+            chat = message.get("chat") or {}
+            sender = message.get("from") or {}
+            chat_id = str(chat.get("id") or "")
+            if allowed and chat_id not in allowed:
+                continue
+            text = message.get("text") or message.get("caption") or ""
+            if not text.strip():
+                text = "[Telegram 非文本消息，暂未抓取附件]"
+            provider_id = f"telegram:{chat_id}:{message.get('message_id')}"
+            name = " ".join(x for x in [sender.get("first_name"), sender.get("last_name")] if x).strip() or sender.get("username") or f"Telegram {sender.get('id') or chat_id}"
+            subject_name = chat.get("title") or sender.get("username") or name
+            mail = IncomingMail(
+                mailbox_id=config["mailbox_id"],
+                sender_name=name[:120],
+                sender_email=f"tg_{sender.get('id') or chat_id}@telegram.geekforest.ai",
+                subject=f"Telegram: {subject_name}"[:300],
+                body=text[:20000],
+                provider_message_id=provider_id,
+                internet_message_id=f"<telegram-{chat_id}-{message.get('message_id')}@telegram.local>",
+                historical=False,
+            )
+            receive_mail(mail)
+        if max_update_id != config["last_update_id"]:
+            save_app_settings({"telegram_last_update_id": str(max_update_id)})
+
+
 class IncomingMail(BaseModel):
     mailbox_id: str
     sender_name: str = Field(min_length=1, max_length=120)
@@ -1442,6 +1614,14 @@ class IncomingMail(BaseModel):
     references_header: Optional[str] = Field(default=None, max_length=4000)
     historical: bool = False
     attachments: list[IncomingAttachment] = Field(default_factory=list)
+
+
+@app.post("/api/integrations/telegram/incoming")
+def telegram_incoming(mail: IncomingMail, request: Request):
+    if not internal_api_authorized(request):
+        raise HTTPException(401, detail={"error": "INVALID_API_TOKEN"})
+    ensure_telegram_mailbox()
+    return receive_mail(mail)
 
 
 def row_dict(row: sqlite3.Row) -> dict:
@@ -1815,7 +1995,7 @@ def receive_mail(mail: IncomingMail):
                     direction="inbound", filename=item.filename, content_type=item.content_type, data=data, created_at=ts)
             except (ValueError, HTTPException):
                 logging.getLogger("ticket-mail").warning("skip invalid inbound attachment ticket=%s filename=%s", ticket_id, item.filename)
-        send_ack = not ticket and not mail.historical and should_send_workspace_ticket_ack(mailbox["workspace_id"], str(mail.sender_email))
+        send_ack = not ticket and not mail.historical and mail.mailbox_id != "telegram" and should_send_workspace_ticket_ack(mailbox["workspace_id"], str(mail.sender_email))
         if send_ack:
             ack = (
                 f"Hello {mail.sender_name},\n\n"
