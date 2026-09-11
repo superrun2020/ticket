@@ -1076,6 +1076,10 @@ def send_admob_policy_notification(ticket_id: str, issue: dict, project: dict) -
         if payload and payload.get("ok", True):
             return True, ""
         return False, "NOTIFY_NOT_OK"
+    except urllib.error.HTTPError as exc:
+        detail = f"HTTP_{exc.code}"
+        logging.getLogger("ticket-admob-policy").warning("admob policy notification failed ticket=%s error=%s", ticket_id, detail)
+        return False, detail
     except Exception as exc:
         logging.getLogger("ticket-admob-policy").warning("admob policy notification failed ticket=%s type=%s", ticket_id, type(exc).__name__)
         return False, type(exc).__name__
@@ -1088,7 +1092,8 @@ def process_admob_policy_alerts(limit: int = 20) -> int:
             JOIN mailboxes mb ON mb.id=t.mailbox_id
             JOIN messages msg ON msg.ticket_id=t.id AND msg.direction='inbound'
             LEFT JOIN admob_policy_alerts a ON a.ticket_id=t.id
-            WHERE mb.id='google-admob' AND t.subject LIKE ? AND a.ticket_id IS NULL
+            WHERE mb.id='google-admob' AND t.subject LIKE ?
+              AND (a.ticket_id IS NULL OR (a.notification_sent_at IS NULL AND a.notification_error!='PARSE_FAILED'))
             ORDER BY t.created_at DESC LIMIT ?""", (f"%{ADMOB_POLICY_SUBJECT_MARKER}%", max(1, limit)))]
     for row in rows:
         ts = now()
