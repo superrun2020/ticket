@@ -61,7 +61,7 @@ mail_tls_status_cache: tuple[float, bool] = (0.0, False)
 MAIL_PROVISION_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", "oc_abb45b64cf2f1137796a94609bf6eccd")
 MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID", "oc_39c1db188aac4caabd7e22367984f7be")
 ACK_DISABLED_WORKSPACES = {
-    value.strip() for value in os.getenv("TICKET_ACK_DISABLED_WORKSPACES", "bounder").split(",") if value.strip()
+    value.strip() for value in os.getenv("TICKET_ACK_DISABLED_WORKSPACES", "bounder,google-admob").split(",") if value.strip()
 }
 AUTO_CREATE_MAILBOXES = {
     value.strip().lower() for value in os.getenv("TICKET_AUTO_CREATE_MAILBOXES", "").split(",") if value.strip()
