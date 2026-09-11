@@ -60,6 +60,7 @@ mail_domain_status_cache: dict[str, tuple[float, str, dict]] = {}
 mail_tls_status_cache: tuple[float, bool] = (0.0, False)
 MAIL_PROVISION_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", "oc_abb45b64cf2f1137796a94609bf6eccd")
 MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID", "oc_39c1db188aac4caabd7e22367984f7be")
+ADMOB_POLICY_NOTIFY_CHAT_ID = os.getenv("TICKET_ADMOB_POLICY_NOTIFY_CHAT_ID", MAIL_PROVISION_NOTIFY_CHAT_ID)
 ACK_DISABLED_WORKSPACES = {
     value.strip() for value in os.getenv("TICKET_ACK_DISABLED_WORKSPACES", "bounder,google-admob").split(",") if value.strip()
 }
@@ -292,6 +293,11 @@ def init_db() -> None:
             subject_snapshot TEXT NOT NULL, body_snapshot TEXT NOT NULL,
             actor TEXT NOT NULL, created_at TEXT NOT NULL)""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_category_feedback_workspace_time ON ai_category_feedback(workspace_id, created_at DESC)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS admob_policy_alerts (
+            ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), pub_id TEXT NOT NULL, package_name TEXT NOT NULL,
+            project_code TEXT NOT NULL DEFAULT '', project_name TEXT NOT NULL DEFAULT '', match_status TEXT NOT NULL,
+            notification_sent_at TEXT, notification_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_admob_policy_alerts_sent ON admob_policy_alerts(notification_sent_at, updated_at)")
         ts = now()
         conn.execute("INSERT OR IGNORE INTO workspaces(id,name,slug,created_at,updated_at) VALUES('geekforest','GeekForest','geekforest',?,?)", (ts, ts))
         conn.execute("INSERT OR IGNORE INTO workspaces(id,name,slug,created_at,updated_at) VALUES('eddy-personal','Eddy 个人工作区','eddy-personal',?,?)", (ts, ts))
@@ -990,6 +996,120 @@ def notify_mailbox_owner_created(cfg: dict, email_address: str, domain: str) -> 
         logging.getLogger("ticket-mail-admin").warning("mail provision owner notification failed type=%s", type(exc).__name__)
         return False
 
+
+
+ADMOB_POLICY_SUBJECT_MARKER = "您需要解决一个问题，否则广告可能会停止展示"
+
+
+def extract_admob_policy_issue(text: str) -> Optional[dict]:
+    source = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not source:
+        return None
+    pub_match = re.search(r"pub-\d{12,20}", source, re.I)
+    pkg_match = re.search(r"Google\s*Play\s*应用\s*ID\s*[：:]\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+){1,})", source, re.I)
+    if not pkg_match:
+        pkg_match = re.search(r"\b([a-z][a-z0-9_]*(?:\.[a-z0-9_]+){2,})\b", source)
+    if not pub_match or not pkg_match:
+        return None
+    return {"pub_id": pub_match.group(0).lower(), "package_name": pkg_match.group(1).strip()}
+
+
+@contextmanager
+def source_project_db():
+    required = ("TICKET_SOURCE_DB_HOST", "TICKET_SOURCE_DB_USER", "TICKET_SOURCE_DB_PASSWORD", "TICKET_SOURCE_DB_NAME")
+    if any(not os.getenv(key) for key in required):
+        yield None
+        return
+    conn = pymysql.connect(host=os.environ["TICKET_SOURCE_DB_HOST"], port=int(os.getenv("TICKET_SOURCE_DB_PORT", "3306")),
+        user=os.environ["TICKET_SOURCE_DB_USER"], password=os.environ["TICKET_SOURCE_DB_PASSWORD"],
+        database=os.environ["TICKET_SOURCE_DB_NAME"], charset="utf8mb4", autocommit=True,
+        connect_timeout=8, read_timeout=15, write_timeout=15, cursorclass=pymysql.cursors.DictCursor)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def lookup_project_by_admob_identity(pub_id: str, package_name: str) -> dict:
+    empty = {"project_code": "未匹配", "project_name": "", "match_status": "not_found"}
+    try:
+        with source_project_db() as conn:
+            if not conn:
+                return {**empty, "match_status": "source_db_not_configured"}
+            with conn.cursor() as cursor:
+                cursor.execute("""SELECT project_code,project_name,package_name,admob_pub_id,status,owner_name
+                    FROM project_projects WHERE package_name=%s OR admob_pub_id=%s
+                    ORDER BY CASE WHEN package_name=%s AND admob_pub_id=%s THEN 0
+                                  WHEN package_name=%s THEN 1 WHEN admob_pub_id=%s THEN 2 ELSE 3 END, updated_at DESC LIMIT 1""",
+                    (package_name, pub_id, package_name, pub_id, package_name, pub_id))
+                row = cursor.fetchone()
+    except Exception as exc:
+        logging.getLogger("ticket-admob-policy").warning("project lookup failed type=%s", type(exc).__name__)
+        return {**empty, "match_status": "lookup_failed"}
+    if not row:
+        return empty
+    row = dict(row)
+    match_status = "matched"
+    if row.get("package_name") != package_name or row.get("admob_pub_id") != pub_id:
+        match_status = "partial_match"
+    return {"project_code": row.get("project_code") or "未匹配", "project_name": row.get("project_name") or "",
+        "match_status": match_status, "owner_name": row.get("owner_name") or ""}
+
+
+def send_admob_policy_notification(ticket_id: str, issue: dict, project: dict) -> tuple[bool, str]:
+    chat_id = os.getenv("TICKET_ADMOB_POLICY_NOTIFY_CHAT_ID", ADMOB_POLICY_NOTIFY_CHAT_ID).strip()
+    if not chat_id:
+        return False, "CHAT_ID_NOT_CONFIGURED"
+    project_code = project.get("project_code") or "未匹配"
+    text = ("⚠️ Google AdMob 政策提醒\n"
+            f"项目代号：{project_code}\n"
+            f"PubID：{issue['pub_id']}\n"
+            f"包名：{issue['package_name']}\n"
+            "有问题需要查看，请尽快查看：您需要解决一个问题，否则广告可能会停止展示\n"
+            f"工单：{ticket_id}")
+    try:
+        payload = internal_notify_request(
+            "/api/internal/feishu/message/send",
+            {"chatIds": [chat_id], "text": text, "bizType": "admob_policy_issue", "bizKey": f"admob-policy-{ticket_id}"},
+            f"admob-policy-{ticket_id}",
+        )
+        if payload and payload.get("ok", True):
+            return True, ""
+        return False, "NOTIFY_NOT_OK"
+    except Exception as exc:
+        logging.getLogger("ticket-admob-policy").warning("admob policy notification failed ticket=%s type=%s", ticket_id, type(exc).__name__)
+        return False, type(exc).__name__
+
+
+def process_admob_policy_alerts(limit: int = 20) -> int:
+    completed = 0
+    with db() as conn:
+        rows = [dict(x) for x in conn.execute("""SELECT t.id ticket_id,t.subject,msg.body FROM tickets t
+            JOIN mailboxes mb ON mb.id=t.mailbox_id
+            JOIN messages msg ON msg.ticket_id=t.id AND msg.direction='inbound'
+            LEFT JOIN admob_policy_alerts a ON a.ticket_id=t.id
+            WHERE mb.id='google-admob' AND t.subject LIKE ? AND a.ticket_id IS NULL
+            ORDER BY t.created_at DESC LIMIT ?""", (f"%{ADMOB_POLICY_SUBJECT_MARKER}%", max(1, limit)))]
+    for row in rows:
+        ts = now()
+        issue = extract_admob_policy_issue(f"{row['subject']}\n{row['body']}")
+        if not issue:
+            with db() as conn:
+                conn.execute("""INSERT OR IGNORE INTO admob_policy_alerts
+                    (ticket_id,pub_id,package_name,project_code,project_name,match_status,notification_error,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?)""", (row["ticket_id"], "", "", "", "", "parse_failed", "PARSE_FAILED", ts, ts))
+            completed += 1
+            continue
+        project = lookup_project_by_admob_identity(issue["pub_id"], issue["package_name"])
+        sent, error = send_admob_policy_notification(row["ticket_id"], issue, project)
+        with db() as conn:
+            conn.execute("""INSERT OR REPLACE INTO admob_policy_alerts
+                (ticket_id,pub_id,package_name,project_code,project_name,match_status,notification_sent_at,notification_error,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""", (row["ticket_id"], issue["pub_id"], issue["package_name"],
+                project.get("project_code") or "", project.get("project_name") or "", project.get("match_status") or "unknown",
+                now() if sent else None, error, ts, now()))
+        completed += 1
+    return completed
 
 def ask_ai(instructions: str, text: str) -> str:
     config = get_ai_config()

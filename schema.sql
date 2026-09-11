@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS ai_category_feedback (
   actor TEXT NOT NULL, created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_category_feedback_workspace_time ON ai_category_feedback(workspace_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS admob_policy_alerts (
+  ticket_id TEXT PRIMARY KEY REFERENCES tickets(id), pub_id TEXT NOT NULL, package_name TEXT NOT NULL,
+  project_code TEXT NOT NULL DEFAULT '', project_name TEXT NOT NULL DEFAULT '', match_status TEXT NOT NULL,
+  notification_sent_at TEXT, notification_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_admob_policy_alerts_sent ON admob_policy_alerts(notification_sent_at, updated_at);
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
   sender_name TEXT NOT NULL, sender_email TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0,

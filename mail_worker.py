@@ -316,6 +316,13 @@ class MailWorker:
                         log.info("AI classified %s pending tickets", classified)
                 except Exception:
                     log.exception("AI classification batch failed")
+                try:
+                    from app import process_admob_policy_alerts
+                    alerted = process_admob_policy_alerts(int(os.getenv("TICKET_ADMOB_POLICY_ALERT_BATCH", "20")))
+                    if alerted:
+                        log.info("AdMob policy alerts processed %s tickets", alerted)
+                except Exception:
+                    log.exception("AdMob policy alert processing failed")
             except Exception:
                 log.exception("mail worker cycle failed")
             self.stop_event.wait(int(os.getenv("TICKET_MAIL_POLL_SECONDS", "30")))
