@@ -60,7 +60,7 @@ mail_domain_status_cache: dict[str, tuple[float, str, dict]] = {}
 mail_tls_status_cache: tuple[float, bool] = (0.0, False)
 MAIL_PROVISION_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_NOTIFY_CHAT_ID", "oc_abb45b64cf2f1137796a94609bf6eccd")
 MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID = os.getenv("TICKET_MAIL_PROVISION_OWNER_NOTIFY_CHAT_ID", "oc_39c1db188aac4caabd7e22367984f7be")
-ADMOB_POLICY_NOTIFY_CHAT_ID = os.getenv("TICKET_ADMOB_POLICY_NOTIFY_CHAT_ID", MAIL_PROVISION_NOTIFY_CHAT_ID)
+ADMOB_POLICY_NOTIFY_CHAT_ID = os.getenv("TICKET_ADMOB_POLICY_NOTIFY_CHAT_ID", "oc_099a8f5c92f7c7a78ad15f7cd60db573")
 ACK_DISABLED_WORKSPACES = {
     value.strip() for value in os.getenv("TICKET_ACK_DISABLED_WORKSPACES", "bounder,google-admob").split(",") if value.strip()
 }
@@ -763,6 +763,12 @@ def get_app_settings(prefix: str) -> dict:
         return {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM app_settings WHERE key LIKE ?", (f"{prefix}%",))}
 
 
+def get_app_setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else default
+
+
 def save_app_settings(values: dict[str, str], secret_keys: set[str] | None = None) -> None:
     ts = now()
     secret_keys = secret_keys or set()
@@ -1057,8 +1063,8 @@ def lookup_project_by_admob_identity(pub_id: str, package_name: str) -> dict:
 
 
 def send_admob_policy_notification(ticket_id: str, issue: dict, project: dict) -> tuple[bool, str]:
-    chat_id = os.getenv("TICKET_ADMOB_POLICY_NOTIFY_CHAT_ID", ADMOB_POLICY_NOTIFY_CHAT_ID).strip()
-    if not chat_id:
+    chat_ids = [item.strip() for item in get_app_setting("admob_policy_alert_chat_ids", os.getenv("TICKET_ADMOB_POLICY_NOTIFY_CHAT_ID", ADMOB_POLICY_NOTIFY_CHAT_ID)).split(",") if item.strip()]
+    if not chat_ids:
         return False, "CHAT_ID_NOT_CONFIGURED"
     project_code = project.get("project_code") or "未匹配"
     text = ("⚠️ Google AdMob 政策提醒\n"
@@ -1070,7 +1076,7 @@ def send_admob_policy_notification(ticket_id: str, issue: dict, project: dict) -
     try:
         payload = internal_notify_request(
             "/api/internal/feishu/message/send",
-            {"chatIds": [chat_id], "text": text, "bizType": "admob_policy_issue", "bizKey": f"admob-policy-{ticket_id}"},
+            {"chatIds": chat_ids[:10], "text": text, "bizType": "admob_policy_issue", "bizKey": f"admob-policy-{ticket_id}"},
             f"admob-policy-{ticket_id}",
         )
         if payload and payload.get("ok", True):
@@ -1087,6 +1093,12 @@ def send_admob_policy_notification(ticket_id: str, issue: dict, project: dict) -
 
 def process_admob_policy_alerts(limit: int = 20) -> int:
     completed = 0
+    started_at = get_app_setting("admob_policy_alert_started_at", "")
+    started_filter = "AND t.created_at >= ?" if started_at else ""
+    params = [f"%{ADMOB_POLICY_SUBJECT_MARKER}%"]
+    if started_at:
+        params.append(started_at)
+    params.append(max(1, limit))
     with db() as conn:
         rows = [dict(x) for x in conn.execute("""SELECT t.id ticket_id,t.subject,msg.body FROM tickets t
             JOIN mailboxes mb ON mb.id=t.mailbox_id
@@ -1094,7 +1106,8 @@ def process_admob_policy_alerts(limit: int = 20) -> int:
             LEFT JOIN admob_policy_alerts a ON a.ticket_id=t.id
             WHERE mb.id='google-admob' AND t.subject LIKE ?
               AND (a.ticket_id IS NULL OR (a.notification_sent_at IS NULL AND a.notification_error!='PARSE_FAILED'))
-            ORDER BY t.created_at DESC LIMIT ?""", (f"%{ADMOB_POLICY_SUBJECT_MARKER}%", max(1, limit)))]
+              {started_filter}
+            ORDER BY t.created_at DESC LIMIT ?""".format(started_filter=started_filter), tuple(params))]
     for row in rows:
         ts = now()
         issue = extract_admob_policy_issue(f"{row['subject']}\n{row['body']}")
