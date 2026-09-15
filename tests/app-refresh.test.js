@@ -66,6 +66,66 @@ test('load rejects a request invalidated by workspace generation even after A to
   assert.deepEqual(context.state.tickets, []);
 });
 
+function sidebarRefreshHarness({mailbox='A042A'}={}) {
+  const requests = [], toasts = [];
+  const button = {disabled:false, textContent:'↻', attributes:{}, setAttribute(name,value){this.attributes[name]=value}, removeAttribute(name){delete this.attributes[name]}};
+  const context = {
+    URLSearchParams, JSON,
+    state:{status:'open',mailbox,tag:'vip',q:'needle',view:'mine',priority:'urgent',category:'billing',sort:'oldest',tickets:[],selected:'T1',session:{user:{workspace_id:'W1'}}},
+    listRequestSequence:0, workspaceGeneration:0,
+    api:url=>{const pending=deferred();requests.push({url,pending});return pending.promise},
+    renderList(){},renderNav(){},toast:message=>toasts.push(message),
+  };
+  vm.createContext(context);
+  vm.runInContext(extract('async function load(', 'function applySession(')+extract('async function refreshSelectedMailbox(', 'function renderNav('), context);
+  return {context,requests,toasts,button};
+}
+
+test('sidebar refresh requests only the captured mailbox with existing filters', async () => {
+  const h=sidebarRefreshHarness();
+  const refresh=h.context.refreshSelectedMailbox(h.button);
+  assert.equal(h.requests.length,1);
+  const params=new URL(h.requests[0].url,'https://example.test').searchParams;
+  assert.equal(params.get('mailbox'),'A042A');
+  assert.deepEqual(Object.fromEntries(params),{status:'open',mailbox:'A042A',tag:'vip',q:'needle',view:'mine',priority:'urgent',category:'billing',sort:'oldest'});
+  assert.equal(h.button.disabled,true);
+  h.requests[0].pending.resolve(payload('NEW'));
+  await refresh;
+  assert.equal(h.button.disabled,false);
+  assert.match(h.toasts.at(-1),/A042A.*刷新/);
+});
+
+test('sidebar refresh does nothing without a concrete mailbox and prevents duplicate clicks', async () => {
+  const none=sidebarRefreshHarness({mailbox:'all'});
+  assert.equal(await none.context.refreshSelectedMailbox(none.button),false);
+  assert.equal(none.requests.length,0);
+  const h=sidebarRefreshHarness();
+  const first=h.context.refreshSelectedMailbox(h.button);
+  assert.equal(await h.context.refreshSelectedMailbox(h.button),false);
+  assert.equal(h.requests.length,1);
+  h.requests[0].pending.resolve(payload('NEW'));await first;
+});
+
+test('sidebar refresh rejection restores its button', async () => {
+  const h=sidebarRefreshHarness();
+  const refresh=h.context.refreshSelectedMailbox(h.button);
+  h.requests[0].pending.resolve(Promise.reject(new Error('offline')));
+  await refresh;
+  assert.equal(h.button.disabled,false);
+  assert.equal(h.button.attributes['aria-busy'],undefined);
+  assert.match(h.toasts.at(-1),/失败/);
+});
+
+test('sidebar refresh suppresses stale notification after switching during request', async () => {
+  const h=sidebarRefreshHarness();
+  const refresh=h.context.refreshSelectedMailbox(h.button);
+  h.context.state.mailbox='B055B';
+  h.context.listRequestSequence++;
+  h.requests[0].pending.resolve(payload('STALE'));
+  await refresh;
+  assert.deepEqual(h.toasts,[]);
+});
+
 test('failed switch reconciles the original workspace, preserves drafts, and resumes polling', async () => {
   const h = switchHarness();
   await h.context.switchWorkspace('B', h.selector);
