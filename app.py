@@ -1877,6 +1877,28 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
     return {"ok": True, "tickets": tickets, "counts": counts, "summary": {"unprocessed": counts.get("open", 0), "unread_messages": unread_messages}, "mailboxes": boxes, "tag_options": tag_options, "category_options": category_options, "category_counts": category_counts}
 
 
+@app.get("/api/mail/inbound-cursor")
+def inbound_message_cursor(request: Request, since: Optional[int] = None):
+    """Read-only workspace feed used to notice mail already ingested into tickets."""
+    context = current_context(request)
+    if since is not None and since < 0:
+        raise HTTPException(422, detail={"error": "INVALID_CURSOR"})
+    with db() as conn:
+        if since is None:
+            cursor = conn.execute("""SELECT COALESCE(MAX(msg.rowid),0) FROM messages msg
+                JOIN tickets t ON t.id=msg.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
+                WHERE m.workspace_id=? AND msg.direction='inbound'""", (context["workspace_id"],)).fetchone()[0]
+            messages = []
+        else:
+            messages = [row_dict(row) for row in conn.execute("""SELECT msg.rowid cursor,msg.id,msg.ticket_id,
+                msg.sender_name,msg.created_at,t.subject
+                FROM messages msg JOIN tickets t ON t.id=msg.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
+                WHERE m.workspace_id=? AND msg.direction='inbound' AND msg.rowid>?
+                ORDER BY msg.rowid LIMIT 100""", (context["workspace_id"], since))]
+            cursor = messages[-1]["cursor"] if messages else since
+    return {"ok": True, "cursor": cursor, "messages": messages}
+
+
 @app.get("/api/mailbox-tags")
 def mailbox_tags(request: Request):
     context = current_context(request)
@@ -2178,6 +2200,6 @@ def index():
 
 @app.get("/static/{filename}")
 def static(filename: str):
-    if filename not in {"app.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
+    if filename not in {"app.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
         raise HTTPException(404)
     return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "no-cache, must-revalidate"})
