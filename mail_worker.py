@@ -17,12 +17,21 @@ import time
 from datetime import datetime, timezone
 from email.header import decode_header
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid, parseaddr
+from email.utils import formatdate, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 from cryptography.fernet import Fernet
 
 log = logging.getLogger("ticket-mail")
 TICKET_RE = re.compile(r"\[(TKT-\d+)\]", re.I)
+
+
+def normalized_header_addresses(*values: str) -> list[str]:
+    addresses = []
+    for _, address in getaddresses([str(value or "") for value in values]):
+        candidate = address.strip().lower()
+        if re.fullmatch(r"[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+", candidate):
+            addresses.append(candidate)
+    return list(dict.fromkeys(addresses))
 
 
 def _delivery_report(msg: email.message.Message) -> tuple[str, str, str] | None:
@@ -450,7 +459,7 @@ class MailWorker:
                     with self.db() as conn:
                         conn.execute("UPDATE mailbox_sync SET last_uid=?,updated_at=datetime('now') WHERE mailbox_id=?", (uid, cfg["id"]))
                     continue
-                self.receive(IncomingMail(mailbox_id=cfg["id"], sender_name=(sender_name or sender_email)[:120], sender_email=sender_email, subject=subject[:300], body=(_body(msg) or "（无正文）")[:20_000], in_reply_to_ticket=match.group(1).upper() if match else None, provider_message_id=f"{cfg['id']}:{uid}", internet_message_id=(msg.get("Message-ID") or "")[:1000] or None, references_header=((msg.get("References") or msg.get("In-Reply-To") or "")[:4000] or None), historical=backfill_active, attachments=_attachments(msg)))
+                self.receive(IncomingMail(mailbox_id=cfg["id"], sender_name=(sender_name or sender_email)[:120], sender_email=sender_email, subject=subject[:300], body=(_body(msg) or "（无正文）")[:20_000], in_reply_to_ticket=match.group(1).upper() if match else None, provider_message_id=f"{cfg['id']}:{uid}", internet_message_id=(msg.get("Message-ID") or "")[:1000] or None, references_header=((msg.get("References") or msg.get("In-Reply-To") or "")[:4000] or None), to_emails=normalized_header_addresses(*(msg.get_all("To", []) or [])), cc_emails=normalized_header_addresses(*(msg.get_all("Cc", []) or [])), reply_to_emails=normalized_header_addresses(*(msg.get_all("Reply-To", []) or [])), historical=backfill_active, attachments=_attachments(msg)))
                 with self.db() as conn:
                     conn.execute("UPDATE mailbox_sync SET last_uid=?,updated_at=datetime('now') WHERE mailbox_id=?", (uid, cfg["id"]))
             if backfill_active:

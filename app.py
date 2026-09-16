@@ -264,7 +264,7 @@ def init_db() -> None:
         # Additive migration for databases created by the early prototype.
         migrations = {
             "mailboxes": [("enabled", "INTEGER NOT NULL DEFAULT 1"), ("workspace_id", "TEXT NOT NULL DEFAULT 'geekforest'"), ("mailbox_tag", "TEXT NOT NULL DEFAULT '未分类'")],
-            "messages": [("provider_message_id", "TEXT"), ("internet_message_id", "TEXT"), ("references_header", "TEXT"), ("delivery_status", "TEXT NOT NULL DEFAULT 'received'"), ("sent_at", "TEXT"), ("delivered_at", "TEXT"), ("opened_at", "TEXT"), ("failed_at", "TEXT"), ("open_count", "INTEGER NOT NULL DEFAULT 0"), ("delivery_error", "TEXT")],
+            "messages": [("provider_message_id", "TEXT"), ("internet_message_id", "TEXT"), ("references_header", "TEXT"), ("inbound_to_emails", "TEXT"), ("inbound_cc_emails", "TEXT"), ("inbound_reply_to_emails", "TEXT"), ("delivery_status", "TEXT NOT NULL DEFAULT 'received'"), ("sent_at", "TEXT"), ("delivered_at", "TEXT"), ("opened_at", "TEXT"), ("failed_at", "TEXT"), ("open_count", "INTEGER NOT NULL DEFAULT 0"), ("delivery_error", "TEXT")],
             "outbox": [("updated_at", "TEXT"), ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"), ("internet_message_id", "TEXT"), ("in_reply_to", "TEXT"), ("references_header", "TEXT"), ("to_emails", "TEXT"), ("cc_emails", "TEXT"), ("bcc_emails", "TEXT"), ("message_id", "TEXT"), ("tracking_token", "TEXT"), ("delivered_at", "TEXT"), ("opened_at", "TEXT"), ("open_count", "INTEGER NOT NULL DEFAULT 0")],
             "mailbox_sync": [("backfill_active", "INTEGER NOT NULL DEFAULT 0"), ("backfill_target_uid", "INTEGER"), ("last_backfill_at", "TEXT")],
             "tickets": [("ai_category", "TEXT NOT NULL DEFAULT '待分类'"), ("ai_category_status", "TEXT NOT NULL DEFAULT 'pending'"), ("ai_category_confidence", "REAL"), ("ai_category_reason", "TEXT"), ("ai_category_source", "TEXT NOT NULL DEFAULT 'ai'"), ("ai_classified_at", "TEXT")],
@@ -361,6 +361,9 @@ def shutdown() -> None:
 class ReplyIn(BaseModel):
     body: str = Field(min_length=1, max_length=20_000)
     close_after_send: bool = False
+    to: Optional[list[str]] = None
+    cc: Optional[list[str]] = None
+    parent_message_id: Optional[str] = Field(default=None, max_length=100)
 
 
 class ComposeMailIn(BaseModel):
@@ -894,6 +897,94 @@ def parse_recipient_list(raw: str) -> list[str]:
             raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": value[:160]})
         values.append(value)
     return list(dict.fromkeys(values))
+
+
+def strict_recipients(values: Optional[list[str] | str]) -> list[str]:
+    if values is None:
+        return []
+    raw_values = values if isinstance(values, list) else [values]
+    result: list[str] = []
+    for raw in raw_values:
+        raw_text = str(raw)
+        if "\r" in raw_text or "\n" in raw_text or raw_text != raw_text.strip():
+            raise HTTPException(422, detail={"error": "INVALID_RECIPIENT"})
+        normalized = re.sub(r"[，；、]+", ",", raw_text)
+        for item in normalized.split(","):
+            candidate = item.strip().lower()
+            if not candidate:
+                continue
+            if any(character.isspace() for character in candidate) or candidate.count("@") != 1:
+                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": candidate[:160]})
+            local, domain = candidate.rsplit("@", 1)
+            try:
+                ascii_domain = domain.encode("idna").decode("ascii")
+            except UnicodeError:
+                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": candidate[:160]})
+            labels = ascii_domain.split(".")
+            if (not re.fullmatch(r'[^@\s,;<>\"]+', local) or len(local) > 64 or len(ascii_domain) > 253 or
+                    len(labels) < 2 or any(not label or len(label) > 63 or label.startswith("-") or
+                    label.endswith("-") or not re.fullmatch(r"[a-z0-9-]+", label, re.IGNORECASE) for label in labels)):
+                raise HTTPException(422, detail={"error": "INVALID_RECIPIENT", "value": candidate[:160]})
+            result.append(candidate)
+    return list(dict.fromkeys(result))
+
+
+def normalized_incoming_recipients(values: list[str]) -> list[str]:
+    result = []
+    for _, address in getaddresses([str(value or "") for value in values]):
+        candidate = address.strip().lower()
+        if re.fullmatch(r"[^@\s,;<>]+@[^@\s,;<>]+\.[^@\s,;<>]+", candidate):
+            result.append(candidate)
+    return list(dict.fromkeys(result))
+
+
+def _stored_recipients(value: Optional[str]) -> list[str]:
+    return [item.strip().lower() for item in (value or "").split(",") if item.strip()]
+
+
+def _reply_preview(conn: sqlite3.Connection, ticket: sqlite3.Row, parent_message_id: Optional[str] = None,
+                   parent_supplied: bool = False) -> dict:
+    if parent_message_id:
+        parent = conn.execute("SELECT * FROM messages WHERE id=? AND ticket_id=? AND direction='inbound'", (parent_message_id, ticket["id"])).fetchone()
+        if not parent:
+            raise HTTPException(422, detail={"error": "INVALID_REPLY_PARENT"})
+    elif not parent_supplied:
+        parent = conn.execute("SELECT * FROM messages WHERE ticket_id=? AND direction='inbound' ORDER BY created_at DESC,rowid DESC LIMIT 1", (ticket["id"],)).fetchone()
+    else:
+        parent = None
+    own = ticket["mailbox_email"].strip().lower()
+    fallback = ticket["customer_email"].strip().lower()
+    if not parent:
+        target = fallback
+        metadata_unavailable = True
+        original_to, original_cc = [], []
+    else:
+        reply_to = _stored_recipients(parent["inbound_reply_to_emails"])
+        reply_to = list(dict.fromkeys(address for address in reply_to if address != own))
+        target = reply_to or ([parent["sender_email"].strip().lower()] if parent["sender_email"].strip().lower() != own else [])
+        metadata_unavailable = all(parent[key] is None for key in ("inbound_to_emails", "inbound_cc_emails", "inbound_reply_to_emails"))
+        original_to = _stored_recipients(parent["inbound_to_emails"])
+        original_cc = _stored_recipients(parent["inbound_cc_emails"])
+    if not parent:
+        reply_to_list = [target] if target and target != own else ([fallback] if fallback != own else [])
+    else:
+        reply_to_list = target or ([fallback] if fallback != own else [])
+    all_to = list(dict.fromkeys([*reply_to_list, *(x for x in original_to if x != own)]))
+    all_cc = list(dict.fromkeys(x for x in original_cc if x != own and x not in set(all_to)))
+    return {"parent_message_id": parent["id"] if parent else None, "reply": {"to": reply_to_list, "cc": []},
+            "reply_all": {"to": all_to or reply_to_list, "cc": all_cc},
+            "historical_metadata_unavailable": metadata_unavailable}
+
+
+def reply_recipient_preview(ticket_id: str, request: Request, parent_message_id: Optional[str] = None,
+                            parent_supplied: bool = False) -> dict:
+    context = current_context(request)
+    with db() as conn:
+        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
+        if not ticket:
+            raise HTTPException(404, detail={"error": "TICKET_NOT_FOUND"})
+        preview = _reply_preview(conn, ticket, parent_message_id, parent_supplied)
+    return {"ok": True, **preview}
 
 
 def internal_notify_token() -> str:
@@ -1750,6 +1841,9 @@ class IncomingMail(BaseModel):
     provider_message_id: Optional[str] = Field(default=None, max_length=500)
     internet_message_id: Optional[str] = Field(default=None, max_length=1000)
     references_header: Optional[str] = Field(default=None, max_length=4000)
+    to_emails: list[str] = Field(default_factory=list)
+    cc_emails: list[str] = Field(default_factory=list)
+    reply_to_emails: list[str] = Field(default_factory=list)
     historical: bool = False
     received_at: Optional[str] = Field(default=None, max_length=40)
     attachments: list[IncomingAttachment] = Field(default_factory=list)
@@ -1821,6 +1915,13 @@ def attach_message_files(conn: sqlite3.Connection, messages: list[dict]) -> list
         by_message.setdefault(item["message_id"], []).append({k: item[k] for k in ("id", "filename", "content_type", "size", "created_at")})
     for message in messages:
         message["attachments"] = by_message.get(message["id"], [])
+    recipients = {row["message_id"]: row for row in conn.execute(
+        f"SELECT message_id,to_emails,cc_emails FROM outbox WHERE message_id IN ({placeholders})", ids)}
+    for message in messages:
+        if message["direction"] == "outbound":
+            saved = recipients.get(message["id"])
+            message["to"] = _stored_recipients(saved["to_emails"]) if saved else []
+            message["cc"] = _stored_recipients(saved["cc_emails"]) if saved else []
     return messages
 
 
@@ -1950,7 +2051,13 @@ def get_ticket(ticket_id: str, request: Request):
             raise HTTPException(404, "Ticket not found")
         conn.execute("UPDATE messages SET is_read=1 WHERE ticket_id=? AND direction='inbound'", (ticket_id,))
         messages = attach_message_files(conn, [row_dict(x) for x in conn.execute("SELECT * FROM messages WHERE ticket_id=? ORDER BY created_at", (ticket_id,))])
-    return {"ok": True, "ticket": row_dict(row), "messages": messages}
+        reply_recipients = _reply_preview(conn, row)
+    return {"ok": True, "ticket": row_dict(row), "messages": messages, "reply_recipients": reply_recipients}
+
+
+@app.get("/api/tickets/{ticket_id}/reply-recipients")
+def get_reply_recipients(ticket_id: str, request: Request, parent_message_id: Optional[str] = None):
+    return reply_recipient_preview(ticket_id, request, parent_message_id, "parent_message_id" in request.query_params)
 
 
 @app.get("/api/attachments/{attachment_id}")
@@ -1968,6 +2075,36 @@ def download_attachment(attachment_id: str, request: Request):
     return FileResponse(path, media_type=row["content_type"], filename=row["filename"])
 
 
+def _queue_reply(conn: sqlite3.Connection, ticket: sqlite3.Row, context: dict, body: str,
+                 close_after_send: bool, supplied_to: Optional[list[str] | str],
+                 supplied_cc: Optional[list[str] | str], parent_message_id: Optional[str],
+                 parent_supplied: bool = False) -> tuple[str, str]:
+    preview = _reply_preview(conn, ticket, parent_message_id, parent_supplied)
+    to_emails = strict_recipients(supplied_to) if supplied_to is not None else preview["reply"]["to"]
+    cc_emails = strict_recipients(supplied_cc) if supplied_cc is not None else []
+    own = ticket["mailbox_email"].strip().lower()
+    to_emails = list(dict.fromkeys(x for x in to_emails if x != own))
+    to_set = set(to_emails)
+    cc_emails = list(dict.fromkeys(x for x in cc_emails if x != own and x not in to_set))
+    if not to_emails:
+        raise HTTPException(422, detail={"error": "RECIPIENT_REQUIRED"})
+    parent = None
+    if preview["parent_message_id"]:
+        parent = conn.execute("SELECT internet_message_id,references_header FROM messages WHERE id=?", (preview["parent_message_id"],)).fetchone()
+    in_reply_to = parent["internet_message_id"] if parent else None
+    references = ((parent["references_header"] or "") + " " + (in_reply_to or "")).strip() if parent else None
+    ts, message_id, outbox_id = now(), str(uuid.uuid4()), str(uuid.uuid4())
+    conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status) VALUES(?,?,?,?,?,?,?,1,'queued')",
+        (message_id, ticket["id"], "outbound", context["display_name"], ticket["mailbox_email"], body, ts))
+    conn.execute("""INSERT INTO outbox
+        (id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header,to_emails,cc_emails,bcc_emails,message_id,tracking_token)
+        VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?)""",
+        (outbox_id, ticket["id"], to_emails[0], f"Re: [{ticket['id']}] {ticket['subject']}", body, ts, ts,
+         in_reply_to, references, ",".join(to_emails), ",".join(cc_emails), "", message_id, secrets.token_urlsafe(32)))
+    conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if close_after_send else "pending", ts, ticket["id"]))
+    return message_id, outbox_id
+
+
 @app.post("/api/tickets/{ticket_id}/reply")
 def reply(ticket_id: str, payload: ReplyIn, request: Request):
     context = current_context(request)
@@ -1975,36 +2112,40 @@ def reply(ticket_id: str, payload: ReplyIn, request: Request):
         ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
         if not ticket:
             raise HTTPException(404, "Ticket not found")
-        ts, message_id = now(), str(uuid.uuid4())
-        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status) VALUES(?,?,?,?,?,?,?,1,'queued')", (message_id, ticket_id, "outbound", context["display_name"], ticket["mailbox_email"], payload.body, ts))
-        parent = conn.execute("SELECT internet_message_id,references_header FROM messages WHERE ticket_id=? AND direction='inbound' ORDER BY created_at DESC LIMIT 1", (ticket_id,)).fetchone()
-        in_reply_to = parent["internet_message_id"] if parent else None
-        references = ((parent["references_header"] or "") + " " + (in_reply_to or "")).strip() if parent else None
-        conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header,message_id,tracking_token) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)", (str(uuid.uuid4()), ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", payload.body, ts, ts, in_reply_to, references, message_id, secrets.token_urlsafe(32)))
-        conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if payload.close_after_send else "pending", ts, ticket_id))
+        fields_set = payload.model_fields_set if hasattr(payload, "model_fields_set") else payload.__fields_set__
+        message_id, _ = _queue_reply(conn, ticket, context, payload.body.strip(), payload.close_after_send,
+            payload.to, payload.cc, payload.parent_message_id, "parent_message_id" in fields_set)
     return {"ok": True, "message_id": message_id, "delivery": "queued"}
 
 
 @app.post("/api/tickets/{ticket_id}/reply-with-attachments")
 async def reply_with_attachments(ticket_id: str, request: Request, body: str = Form(...),
-                                 close_after_send: bool = Form(False), files: list[UploadFile] = File(default=[])):
+                                 close_after_send: bool = Form(False), to: Optional[str] = Form(None),
+                                 cc: Optional[str] = Form(None), parent_message_id: Optional[str] = Form(None),
+                                 files: list[UploadFile] = File(default=[])):
     context = current_context(request)
     clean_body = body.strip()
     if not clean_body:
         raise HTTPException(422, detail={"error": "BODY_REQUIRED"})
+    if hasattr(request, "form"):
+        form = await request.form()
+        to_supplied, cc_supplied = "to" in form, "cc" in form
+        parent_supplied = "parent_message_id" in form
+        raw_to = str(form.get("to", "")) if to_supplied else None
+        raw_cc = str(form.get("cc", "")) if cc_supplied else None
+        raw_parent = (str(form.get("parent_message_id", "")).strip() or None) if parent_supplied else None
+    else:
+        raw_to, raw_cc, raw_parent = to, cc, parent_message_id
+        to_supplied, cc_supplied, parent_supplied = to is not None, cc is not None, parent_message_id is not None
     with db() as conn:
         ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
         if not ticket:
             raise HTTPException(404, "Ticket not found")
-        ts, message_id, outbox_id = now(), str(uuid.uuid4()), str(uuid.uuid4())
-        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,is_read,delivery_status) VALUES(?,?,?,?,?,?,?,1,'queued')", (message_id, ticket_id, "outbound", context["display_name"], ticket["mailbox_email"], clean_body, ts))
-        parent = conn.execute("SELECT internet_message_id,references_header FROM messages WHERE ticket_id=? AND direction='inbound' ORDER BY created_at DESC LIMIT 1", (ticket_id,)).fetchone()
-        in_reply_to = parent["internet_message_id"] if parent else None
-        references = ((parent["references_header"] or "") + " " + (in_reply_to or "")).strip() if parent else None
-        conn.execute("INSERT INTO outbox(id,ticket_id,to_email,subject,body,status,created_at,updated_at,in_reply_to,references_header,message_id,tracking_token) VALUES(?,?,?,?,?,'queued',?,?,?,?,?,?)", (outbox_id, ticket_id, ticket["customer_email"], f"Re: [{ticket_id}] {ticket['subject']}", clean_body, ts, ts, in_reply_to, references, message_id, secrets.token_urlsafe(32)))
+        message_id, outbox_id = _queue_reply(conn, ticket, context, clean_body, close_after_send,
+            raw_to, raw_cc, raw_parent, parent_supplied)
+        ts = now()
         attachments = await save_uploads(conn, ticket_id=ticket_id, message_id=message_id, outbox_id=outbox_id,
             direction="outbound", files=files, created_at=ts)
-        conn.execute("UPDATE tickets SET status=?,updated_at=? WHERE id=?", ("resolved" if close_after_send else "pending", ts, ticket_id))
     return {"ok": True, "message_id": message_id, "delivery": "queued", "attachments": attachments}
 
 
@@ -2148,7 +2289,12 @@ def receive_mail(mail: IncomingMail):
             ticket_id = f"TKT-{sequence}"
             conn.execute("INSERT INTO tickets(id,subject,customer_name,customer_email,mailbox_id,status,priority,assignee,created_at,updated_at) VALUES(?,?,?,?,?,'open','normal','未分配',?,?)", (ticket_id, mail.subject, mail.sender_name, str(mail.sender_email), mail.mailbox_id, ts, ts))
         message_id = str(uuid.uuid4())
-        conn.execute("INSERT INTO messages(id,ticket_id,direction,sender_name,sender_email,body,created_at,provider_message_id,internet_message_id,references_header) VALUES(?,?,?,?,?,?,?,?,?,?)", (message_id, ticket_id, "inbound", mail.sender_name, str(mail.sender_email), mail.body, ts, mail.provider_message_id, mail.internet_message_id, mail.references_header))
+        conn.execute("""INSERT INTO messages
+            (id,ticket_id,direction,sender_name,sender_email,body,created_at,provider_message_id,internet_message_id,references_header,inbound_to_emails,inbound_cc_emails,inbound_reply_to_emails)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (message_id, ticket_id, "inbound", mail.sender_name, str(mail.sender_email), mail.body, ts,
+            mail.provider_message_id, mail.internet_message_id, mail.references_header,
+            ",".join(normalized_incoming_recipients(mail.to_emails)), ",".join(normalized_incoming_recipients(mail.cc_emails)),
+            ",".join(normalized_incoming_recipients(mail.reply_to_emails))))
         for item in mail.attachments[:MAX_ATTACHMENTS_PER_MESSAGE]:
             try:
                 data = base64.b64decode(item.content_b64, validate=True)
