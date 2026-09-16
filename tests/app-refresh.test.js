@@ -12,7 +12,7 @@ function loadHarness() {
   const detail = {innerHTML: 'draft stays'};
   const context = {
     URLSearchParams, state: {status:'all',mailbox:'all',tag:'all',q:'',view:'all',priority:'all',category:'all',sort:'latest',tickets:[],selected:'T1',session:{user:{workspace_id:'A'}}},
-    listRequestSequence: 0, workspaceGeneration: 0, refreshController:{pauseWorkspaceSwitch(){}},
+    listRequestSequence: 0, workspaceGeneration: 0, workspaceSessionDefinitive:true, pendingReplySends:[], refreshController:{pauseWorkspaceSwitch(){}},
     api: url => { const pending = deferred(); requests.push({url, pending}); return pending.promise },
     renderList() {}, renderNav() {}, emptyHtml: () => 'empty', $: selector => selector === '#detail' ? detail : {},
     attachmentState: {reply:[{name:'draft.pdf'}],compose:[]},
@@ -29,7 +29,7 @@ function switchHarness({postResult='reject', sessionResult='A'}={}) {
   const element = key => elements.get(key) || elements.set(key, {innerHTML:'',value:'',textContent:'',hidden:false,onchange:null}).get(key);
   let paused = 0, resumed = 0, changed = 0, loads = 0;
   const context = {
-    state:{status:'all',mailbox:'all',tag:'all',q:'',view:'all',priority:'all',category:'all',sort:'latest',tickets:[],selected:'T1',session:{user:{workspace_id:'A'}}}, workspaceGeneration:0, listRequestSequence:0,
+    state:{status:'all',mailbox:'all',tag:'all',q:'',view:'all',priority:'all',category:'all',sort:'latest',tickets:[],selected:'T1',session:{user:{workspace_id:'A'}}}, workspaceGeneration:0, listRequestSequence:0, workspaceSessionDefinitive:true, pendingReplySends:[],
     refreshController:{pauseWorkspaceSwitch(){paused++},resumeWorkspace(){resumed++},async workspaceChanged(){changed++}},
     api:async url=>{calls.push(url); if(url.includes('/switch')){if(postResult==='reject')throw new Error('POST_FAILED');return {}} if(url.includes('/tickets?')){loads++;return payload('NEW')} if(sessionResult==='unavailable')throw new Error('SESSION_FAILED');return {user:{workspace_id:sessionResult},workspaces:[{id:'A',name:'A'},{id:'B',name:'B'}]};},
     URLSearchParams, JSON, renderList(){}, renderNav(){}, emptyHtml:()=> 'empty', toast:message=>toasts.push(message), esc:value=>String(value??''), initials:value=>String(value??''), preloadMailService:async()=>{},
