@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES tickets(id), direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),
   sender_name TEXT NOT NULL, sender_email TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, is_read INTEGER NOT NULL DEFAULT 0,
   provider_message_id TEXT UNIQUE, internet_message_id TEXT, references_header TEXT,
+  inbound_to_emails TEXT, inbound_cc_emails TEXT, inbound_reply_to_emails TEXT,
   delivery_status TEXT NOT NULL DEFAULT 'received', sent_at TEXT, delivered_at TEXT, opened_at TEXT, failed_at TEXT,
   open_count INTEGER NOT NULL DEFAULT 0, delivery_error TEXT
 );
