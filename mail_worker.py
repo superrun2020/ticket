@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import email
 import base64
+import codecs
 import hashlib
 import html
 import imaplib
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 from email.header import decode_header
 from email.message import EmailMessage
 from email.utils import formatdate, getaddresses, make_msgid, parseaddr
+from html.parser import HTMLParser
 from pathlib import Path
 from cryptography.fernet import Fernet
 
@@ -73,19 +75,97 @@ def _decode(value: str | None) -> str:
     return "".join((x.decode(enc or "utf-8", "replace") if isinstance(x, bytes) else x) for x, enc in parts)
 
 
+def _part_text(part: email.message.Message) -> str:
+    payload = part.get_payload(decode=True) or b""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset)
+    except LookupError:
+        # An unknown label supplies no evidence for a legacy encoding.
+        try:
+            return payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return payload.decode("utf-8", "replace")
+    except UnicodeDecodeError:
+        # Some senders label GBK (the GB2312 superset) as GB2312. Only
+        # widen this known family after strict decoding fails; never guess
+        # an unrelated codec merely because it produces no replacements.
+        if codecs.lookup(charset).name == "gb2312":
+            try:
+                return payload.decode("gbk")
+            except UnicodeDecodeError:
+                pass
+        return payload.decode(charset, "replace")
+
+
+class _HTMLBodyText(HTMLParser):
+    """Extract inert text only; never render HTML or load linked resources."""
+    _hidden = {"head", "title", "script", "style", "template", "iframe", "object"}
+    _blocks = {"p", "div", "br", "hr", "li", "tr", "table", "h1", "h2", "h3", "pre"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.chunks: list[str] = []
+        self.hidden: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        # HTML permits omission of </head> before <body>. Do not let a
+        # body-like tag inside another hidden element end its suppression.
+        if tag == "body" and self.hidden == ["head"]:
+            self.hidden.pop()
+        if tag in self._hidden:
+            self.hidden.append(tag)
+        elif not self.hidden and tag in self._blocks:
+            self.chunks.append("\n")
+        elif not self.hidden and tag in {"td", "th"}:
+            self.chunks.append(" ")
+
+    def handle_endtag(self, tag):
+        if self.hidden:
+            if tag == self.hidden[-1]:
+                self.hidden.pop()
+        elif tag in self._blocks:
+            self.chunks.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.chunks.append(re.sub(r"\s+", " ", data))
+
+    def text(self):
+        return "\n".join(line.strip() for line in "".join(self.chunks).splitlines() if line.strip())
+
+
+def _body_parts(msg: email.message.Message):
+    # A flat walk would also descend into attached messages/multiparts.
+    if msg.get_content_disposition() == "attachment" or msg.get_filename():
+        return
+    if msg.get_content_maintype() == "multipart":
+        for child in msg.get_payload() if msg.is_multipart() else []:
+            yield from _body_parts(child)
+    elif msg.get_content_type() in {"text/plain", "text/html"}:
+        yield msg
+
+
 def _body(msg: email.message.Message) -> str:
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain" and "attachment" not in (part.get("Content-Disposition") or ""):
-                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace").strip()
-        return ""
-    return msg.get_payload(decode=True).decode(msg.get_content_charset() or "utf-8", "replace").strip()
+    parts = list(_body_parts(msg))
+    for part in parts:
+        if part.get_content_type() == "text/plain":
+            text = _part_text(part).strip()
+            if text:
+                return text
+    for part in parts:
+        if part.get_content_type() == "text/html":
+            parser = _HTMLBodyText()
+            parser.feed(_part_text(part))
+            parser.close()
+            text = parser.text()
+            if text:
+                return text
+    return ""
 
 
 def _attachments(msg: email.message.Message) -> list[dict]:
     result = []
-    if not msg.is_multipart():
-        return result
     max_count = int(os.getenv("TICKET_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
     max_bytes = int(os.getenv("TICKET_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
     for part in msg.walk():
