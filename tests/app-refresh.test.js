@@ -40,6 +40,16 @@ function switchHarness({postResult='reject', sessionResult='A'}={}) {
   return {context,selector,detail,calls,toasts,counts:()=>({paused,resumed,changed,loads})};
 }
 
+test('authorized deep-link operation reuses actual workspace guards and reconciles before opening',async()=>{
+ const F=require('../static/feishu.js');
+ for(const sessionResult of ['A','B','unavailable']){
+  const h=switchHarness({sessionResult});let opened=false,authorized=false;
+  const client={refresh:async()=>{},mutate:async()=>{assert.equal(h.context.workspaceSessionDefinitive,false);assert.equal(h.context.state.workspaceSwitchPending,true);authorized=true;return {ticket_id:'TKT-42',workspace_id:'B'}}};
+  const pending=F.openLink(client,{take:()=> 'TKT-42'},{switch:op=>h.context.switchWorkspace(null,h.selector,op),workspace:()=>h.context.state.session.user.workspace_id,definitive:()=>h.context.workspaceSessionDefinitive&&!h.context.state.workspaceSwitchPending,open:async()=>{assert.ok(h.calls.includes('/api/session'));opened=true}});
+  if(sessionResult==='B')await pending;else await assert.rejects(pending);
+  assert.equal(authorized,true);assert.equal(opened,sessionResult==='B');assert.equal(h.calls.includes('/api/workspaces/switch'),false);
+ }
+});
 const payload = id => ({tickets:[{id}], mailboxes:[], category_options:[], counts:{}, summary:{}, tag_options:[], category_counts:{}});
 
 test('load accepts only the newest request across filter changes and preserves detail', async () => {

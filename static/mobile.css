@@ -1,0 +1,75 @@
+/* Keep desktop cascade unchanged; reuse the permission-filtered sidebar on mobile. */
+.mobile-bar, .mobile-close, .mobile-backdrop { display: none; }
+@media (max-width: 850px) {
+  body { height: 100dvh; flex-direction: column; }
+  .mobile-bar { display: flex; flex: none; align-items: center; gap: 8px; padding: env(safe-area-inset-top) max(10px, env(safe-area-inset-right)) 0 max(10px, env(safe-area-inset-left)); background: #fff; border-bottom: 1px solid var(--line); }
+  .mobile-bar button, .mobile-close { border: 0; background: transparent; color: inherit; font: inherit; padding: 10px; }
+  .mobile-bar [hidden], .mobile-backdrop[hidden], .sidebar [hidden] { display: none !important; }
+  button, .tool-button, .icon-btn, .filter, .status-select, .nav-item, .send, .dialog-close, .mailbox-refresh { min-height: 48px; min-width: 48px; }
+  input:not([type=checkbox]):not([type=file]), select, textarea { font-size: 16px !important; min-width: 0; max-width: 100%; }
+  input:not([type=checkbox]):not([type=file]), select { min-height: 48px; }
+  button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid #9484ff; outline-offset: 2px; }
+  .sidebar { display: none; }
+  .sidebar.drawer-open { display: flex; position: fixed; inset: 0 auto 0 0; width: min(360px, calc(100vw - 32px)); height: 100dvh; z-index: 101; padding: max(12px, env(safe-area-inset-top)) 14px max(12px, env(safe-area-inset-bottom)); }
+  .mobile-close { display: block; align-self: flex-end; flex: none; }
+  .sidebar .brand span:last-child, .sidebar .nav-title, .sidebar .profile div:not(.avatar), .sidebar .profile > span { display: block; }
+  .sidebar .compose { display: block; flex: none; }
+  .sidebar .nav-item:not([hidden]) { display: flex; justify-content: flex-start; }
+  .sidebar .nav-item.active b { display: block; }
+  .sidebar nav { overflow-y: auto; overscroll-behavior: contain; min-height: 0; }
+  .sidebar .brand { padding: 0 8px 18px; flex: none; }
+  .sidebar .workspace-switcher { flex: none; }
+  .mailbox-row.active { grid-template-columns: minmax(0,1fr) 48px; }
+  .mailbox-refresh { width: 48px; height: 48px; }
+  .mobile-backdrop:not([hidden]) { display: block; position: fixed; inset: 0; background: #0008; z-index: 100; }
+  main { min-height: 0; overflow: auto; }
+  header { height: auto; flex: none; padding: 12px; flex-wrap: wrap; gap: 12px; }
+  .header-actions { flex-wrap: wrap; min-width: 0; width: 100%; }
+  .search { flex: 1; min-width: 140px; height: 48px; }
+  .search input { width: 100%; }
+  .toolbar { height: auto; flex: none; padding: 0 12px; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .tabs { height: 48px; gap: 16px; }
+  .toolbar > div:last-child { flex-wrap: wrap; padding-bottom: 8px; }
+  .category-chips { max-width: 100%; overflow-x: auto; }
+  .workspace { display: block; flex: 1; min-height: 160px; }
+  .ticket-list { height: 100%; overflow: auto; padding-bottom: env(safe-area-inset-bottom); }
+  .ticket-detail.mobile-open { position: static; display: block; width: 100%; height: 100%; overflow: auto; padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+  .mobile-detail-visible { overflow: hidden; }
+  .mobile-detail-visible > header, .mobile-detail-visible > .toolbar, .mobile-detail-visible #ticketList { display: none; }
+  .mobile-detail-visible .workspace { min-height: 0; overflow: hidden; }
+  .detail-head { padding: 16px 12px; }
+  .detail-head-top, .contact-strip { flex-wrap: wrap; gap: 12px; }
+  .detail-head-top > div, .contact-strip > span { min-width: 0; max-width: 100%; }
+  .detail-actions { margin-left: 0; flex-wrap: wrap; }
+  .conversation { padding: 16px 12px; }
+  .message .customer-avatar { flex: none; }
+  .message-body { min-width: 0; max-width: calc(100% - 45px); }
+  .bubble, .message-info, .message-recipients, .ticket-id, .contact-strip, .detail-head h2, .attachment-link, .picked-attachment, .subject, .customer, .settings-dialog { overflow-wrap: anywhere; }
+  .card-meta { flex-wrap: wrap; }
+  .reply-box { margin: 8px 12px 16px; }
+  .reply-top { grid-template-columns: minmax(0,1fr); }
+  .reply-top small { grid-column: 1; }
+  .reply-mode, .reply-foot, .ai-tools { flex-wrap: wrap; }
+  .reply-foot label { margin-left: 0; min-height: 48px; display: flex; align-items: center; }
+  .reply-box textarea { height: 150px; }
+  .attachment-picker, .picked-attachments { min-width: 0; max-width: 100%; }
+  .picked-attachment { max-width: 100%; white-space: normal; }
+  .compose-page { padding: 16px 12px; }
+  .compose-page-head { flex-wrap: wrap; gap: 12px; }
+  .compose-form { padding: 16px 12px; }
+  .compose-recipient-row { grid-template-columns: minmax(0,1fr); }
+  .compose-form textarea { min-height: 220px; }
+  .compose-page-actions, .settings-actions { flex-wrap: wrap; }
+  dialog.settings-dialog { width: 100%; max-width: 100%; height: auto; max-height: 100dvh; margin: auto; border-radius: 0; overflow: auto; overscroll-behavior: contain; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  dialog.settings-dialog > form { padding: 16px; min-width: 0; }
+  dialog.mail-service-dialog { height: 100dvh; }
+  .mail-service-shell { padding: 16px; }
+  .mail-service-content { overflow: auto; }
+  .mail-service-grid, .domain-status-grid, .domain-checks, .mailbox-admin-grid, .mail-service-form .form-row { grid-template-columns: minmax(0,1fr); }
+  .mail-service-toolbar, .settings-head, .admin-section-head { flex-wrap: wrap; }
+  .settings-head .dialog-close { margin-left: auto; }
+  .mail-service-tabs { overflow-x: auto; }
+  .mail-service-tabs button { flex: none; }
+  .user-row { flex-wrap: wrap; }
+  .toast { max-width: calc(100vw - 24px); right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); z-index: 102; }
+}

@@ -100,3 +100,36 @@ CREATE TABLE IF NOT EXISTS workspace_memberships (
   PRIMARY KEY(user_id, workspace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_memberships_workspace ON workspace_memberships(workspace_id);
+
+-- Feishu is additive: no users, memberships or subscriptions are seeded.
+CREATE TABLE IF NOT EXISTS feishu_bindings (
+ user_id TEXT PRIMARY KEY REFERENCES users(id), app_id TEXT NOT NULL, tenant_key TEXT NOT NULL,
+ open_id TEXT NOT NULL, name TEXT NOT NULL, generation TEXT NOT NULL UNIQUE, bound_at REAL NOT NULL,
+ UNIQUE(app_id,tenant_key,open_id)
+);
+CREATE TABLE IF NOT EXISTS feishu_oauth (
+ state_hash TEXT PRIMARY KEY, correlation_hash TEXT NOT NULL UNIQUE, intent TEXT NOT NULL,
+ user_id TEXT, session_hash TEXT, password_hash TEXT, app_id TEXT NOT NULL, tenant_key TEXT NOT NULL,
+ redirect_uri TEXT NOT NULL, verifier TEXT NOT NULL, expires REAL NOT NULL, stage TEXT NOT NULL,
+ open_id TEXT, name TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_oauth_expiry ON feishu_oauth(expires);
+CREATE TABLE IF NOT EXISTS feishu_subscriptions (
+ user_id TEXT NOT NULL REFERENCES users(id), mailbox_id TEXT NOT NULL REFERENCES mailboxes(id),
+ enabled INTEGER NOT NULL DEFAULT 0, generation TEXT NOT NULL, updated_at REAL NOT NULL,
+ PRIMARY KEY(user_id,mailbox_id)
+);
+CREATE TABLE IF NOT EXISTS feishu_notification_outbox (
+ id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id), ticket_id TEXT NOT NULL REFERENCES tickets(id),
+ mailbox_id TEXT NOT NULL, workspace_id TEXT NOT NULL, user_id TEXT NOT NULL,
+ app_id TEXT NOT NULL, tenant_key TEXT NOT NULL, open_id TEXT NOT NULL, canonical_base TEXT NOT NULL,
+ binding_generation TEXT NOT NULL, subscription_generation TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+ next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0, lease_token TEXT,
+ first_attempt REAL, vendor_message_id TEXT, last_error TEXT, created_at REAL NOT NULL,
+ UNIQUE(message_id,user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_feishu_jobs_due ON feishu_notification_outbox(status,next_attempt,lease_until);
+CREATE TABLE IF NOT EXISTS feishu_audit (
+ id TEXT PRIMARY KEY, user_id TEXT, action TEXT NOT NULL, created_at REAL NOT NULL
+);

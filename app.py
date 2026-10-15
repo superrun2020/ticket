@@ -39,6 +39,7 @@ MAX_ATTACHMENT_BYTES = int(os.getenv("TICKET_MAX_ATTACHMENT_BYTES", str(20 * 102
 MAX_ATTACHMENTS_PER_MESSAGE = int(os.getenv("TICKET_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
 app = FastAPI(title="PostPilot Ticket Desk")
 worker = None
+feishu_worker = None
 telegram_bridge = None
 LOGIN_USER = os.getenv("TICKET_LOGIN_USER", "admin")
 LOGIN_PASSWORD = os.getenv("TICKET_LOGIN_PASSWORD", "")
@@ -79,8 +80,9 @@ def internal_api_authorized(request: Request) -> bool:
     return bool(expected and supplied and hmac.compare_digest(expected, supplied))
 
 
-def session_token(user_id: str, workspace_id: str, expires: int) -> str:
-    payload = base64.urlsafe_b64encode(f"{user_id}:{workspace_id}:{expires}".encode()).decode().rstrip("=")
+def session_token(user_id: str, workspace_id: str, expires: int, feishu_generation: str | None = None) -> str:
+    raw = json.dumps(["feishu", user_id, workspace_id, expires, feishu_generation, secrets.token_urlsafe(16)]) if feishu_generation else f"{user_id}:{workspace_id}:{expires}"
+    payload = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
     signature = hmac.new(SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}.{signature}"
 
@@ -94,13 +96,24 @@ def session_context(token: str | None) -> Optional[dict]:
         return None
     try:
         decoded = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode()
-        user_id, workspace_id, expires = decoded.rsplit(":", 2)
+        generation = None
+        if decoded.startswith('['):
+            method, user_id, workspace_id, expires, generation, nonce = json.loads(decoded)
+            if method != 'feishu' or not generation:
+                return None
+        else:
+            user_id, workspace_id, expires = decoded.rsplit(":", 2)
         if int(expires) <= int(time.time()):
             return None
         with db() as conn:
+            if generation:
+                cfg = feishu.config()
+                if not cfg or not conn.execute('SELECT 1 FROM feishu_bindings WHERE user_id=? AND generation=? AND app_id=? AND tenant_key=?',
+                    (user_id,generation,cfg['app_id'],cfg['tenant'])).fetchone():
+                    return None
             row = conn.execute("SELECT u.id,u.username,u.display_name,u.is_admin,m.role,w.name workspace_name FROM users u JOIN workspace_memberships m ON m.user_id=u.id JOIN workspaces w ON w.id=m.workspace_id WHERE u.id=? AND m.workspace_id=? AND u.enabled=1", (user_id, workspace_id)).fetchone()
-        return dict(row) | {"workspace_id": workspace_id} if row else None
-    except (ValueError, UnicodeDecodeError):
+        return dict(row) | {"workspace_id": workspace_id, "feishu_generation": generation} if row else None
+    except (ValueError, TypeError, UnicodeDecodeError):
         return None
 
 
@@ -135,12 +148,14 @@ async def require_login(request: Request, call_next):
         if internal_api_authorized(request):
             return await call_next(request)
         return JSONResponse({"ok": False, "error": "INVALID_API_TOKEN"}, status_code=401)
-    if request.url.path in {"/login", "/api/auth/login"} or request.url.path.startswith("/static/") or request.url.path.startswith("/api/email-events/open/"):
+    if request.url.path in {"/login", "/api/auth/login", "/api/auth/feishu/status", "/api/auth/feishu/start", "/api/auth/feishu/callback", "/api/auth/feishu/finalize"} or request.url.path.startswith("/static/") or request.url.path.startswith("/api/email-events/open/"):
         return await call_next(request)
     if not valid_session(request.cookies.get("ticket_session")):
         if request.url.path.startswith("/api/"):
             return JSONResponse({"ok": False, "error": "AUTH_REQUIRED"}, status_code=401)
-        return RedirectResponse("/login", status_code=303)
+        ticket_id = request.query_params.get('ticket', '') if request.url.path == '/' else ''
+        target = '/login?ticket=' + ticket_id if re.fullmatch(r'TKT-[0-9]{1,20}', ticket_id) else '/login'
+        return RedirectResponse(target, status_code=303)
     return await call_next(request)
 
 
@@ -343,8 +358,10 @@ def init_db() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    global worker
+    global worker, feishu_worker
     init_db()
+    feishu_worker = feishu.NotificationWorker(sys.modules[__name__])
+    feishu_worker.start()
     from mail_worker import MailWorker
     worker = MailWorker(ROOT, db, receive_mail)
     worker.start()
@@ -352,6 +369,8 @@ def startup() -> None:
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    if feishu_worker:
+        feishu_worker.stop()
     if worker:
         worker.stop()
     if telegram_bridge:
@@ -1297,7 +1316,9 @@ def classify_pending_tickets(limit: int = 5) -> int:
 @app.get("/login")
 def login_page(request: Request):
     if valid_session(request.cookies.get("ticket_session")):
-        return RedirectResponse("/", status_code=303)
+        ticket_id = request.query_params.get('ticket', '')
+        target = '/?ticket=' + ticket_id if re.fullmatch(r'TKT-[0-9]{1,20}',ticket_id) else '/'
+        return RedirectResponse(target, status_code=303)
     return FileResponse(ROOT / "static" / "login.html")
 
 
@@ -1344,7 +1365,7 @@ def switch_workspace(payload: WorkspaceSwitchIn, request: Request):
     if not allowed:
         raise HTTPException(403, detail={"error": "WORKSPACE_FORBIDDEN"})
     response = JSONResponse({"ok": True})
-    response.set_cookie("ticket_session", session_token(context["id"], payload.workspace_id, int(time.time()) + SESSION_TTL), max_age=SESSION_TTL, httponly=True, secure=True, samesite="strict", path="/")
+    response.set_cookie("ticket_session", session_token(context["id"], payload.workspace_id, int(time.time()) + SESSION_TTL, context.get("feishu_generation")), max_age=SESSION_TTL, httponly=True, secure=True, samesite="strict", path="/")
     return response
 
 
@@ -2266,18 +2287,33 @@ def update_ticket(ticket_id: str, changes: dict, request: Request):
 
 
 @app.post("/api/mail/incoming")
+def receive_mail_http(mail: IncomingMail, request: Request):
+    # Browser/session ingress is not the trusted worker entry point.
+    context = current_context(request)
+    origin = os.getenv('TICKET_PUBLIC_BASE_URL', '').rstrip('/') or str(request.base_url).rstrip('/')
+    if request.headers.get('origin') != origin:
+        raise HTTPException(403, detail={"error": "ORIGIN_REJECTED"})
+    with db() as conn:
+        if not conn.execute('SELECT 1 FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1',
+                            (mail.mailbox_id,context['workspace_id'])).fetchone():
+            raise HTTPException(403, detail={"error": "MAILBOX_FORBIDDEN"})
+    return receive_mail(mail)
+
+
 def receive_mail(mail: IncomingMail):
     """Idempotent normalized-mail entry point, shared by webhook and IMAP polling."""
     ts = mail.received_at or now()
     with db() as conn:
         if mail.provider_message_id:
-            existing = conn.execute("SELECT ticket_id FROM messages WHERE provider_message_id=?", (mail.provider_message_id,)).fetchone()
+            existing = conn.execute("SELECT msg.ticket_id,t.mailbox_id FROM messages msg JOIN tickets t ON t.id=msg.ticket_id WHERE msg.provider_message_id=?", (mail.provider_message_id,)).fetchone()
             if existing:
+                if existing['mailbox_id'] != mail.mailbox_id:
+                    raise HTTPException(409, detail={"error": "MESSAGE_SOURCE_CONFLICT"})
                 return {"ok": True, "ticket_id": existing["ticket_id"], "created": False, "duplicate": True}
         mailbox = conn.execute("SELECT id,email,workspace_id FROM mailboxes WHERE id=?", (mail.mailbox_id,)).fetchone()
         if not mailbox:
             raise HTTPException(400, "Unknown mailbox")
-        ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (mail.in_reply_to_ticket,)).fetchone() if mail.in_reply_to_ticket and not mail.historical else None
+        ticket = conn.execute("SELECT * FROM tickets WHERE id=? AND mailbox_id=?", (mail.in_reply_to_ticket, mail.mailbox_id)).fetchone() if mail.in_reply_to_ticket and not mail.historical else None
         if not ticket and not mailbox_can_auto_create_ticket(mailbox):
             logging.getLogger("ticket-mail").info("skip auto ticket creation for unbound mailbox=%s workspace=%s", mailbox["id"], mailbox["workspace_id"])
             return {"ok": True, "ticket_id": None, "created": False, "skipped": True, "reason": "MAILBOX_NOT_PROJECT_BOUND", "confirmation_email": None}
@@ -2302,6 +2338,8 @@ def receive_mail(mail: IncomingMail):
                     direction="inbound", filename=item.filename, content_type=item.content_type, data=data, created_at=ts)
             except (ValueError, HTTPException):
                 logging.getLogger("ticket-mail").warning("skip invalid inbound attachment ticket=%s filename=%s", ticket_id, item.filename)
+        if not mail.historical:
+            feishu.enqueue(conn, message_id, ticket_id, mailbox)
         send_ack = not ticket and not mail.historical and mail.mailbox_id != "telegram" and should_send_workspace_ticket_ack(mailbox["workspace_id"], str(mail.sender_email))
         if send_ack:
             ack = (
@@ -2349,3 +2387,8 @@ def static(filename: str):
     if filename not in {"app.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
         raise HTTPException(404)
     return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+import feishu
+import sys
+feishu.install(sys.modules[__name__])
