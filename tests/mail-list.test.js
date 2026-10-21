@@ -46,10 +46,23 @@ test('delegated mail-list click opens a ticket after the list is redrawn', () =>
 test('mail navigation exposes a mailbox selector and cache-busted app script', () => {
   assert.match(indexSource, /id="mailboxQuickSwitcher"/);
   assert.match(indexSource, /邮箱列表/);
-  assert.match(indexSource, /app\.js\?v=20261021-mailbox-switcher-1/);
+  assert.match(indexSource, /app\.js\?v=20261021-mailbox-switcher-2/);
   assert.match(appSource, /quickSwitcher\.onchange=event=>\{void selectMailbox\(event\.target\.value,quickSwitcher\)\}/);
 });
 
 test('workspace changes clear the previous mailbox filter before reloading', () => {
-  assert.match(appSource, /applySession\(actualSession\);state\.mailbox='all';state\.mailFolder='inbox';/);
+  assert.match(appSource, /applySession\(actualSession\);state\.mailbox=state\.displayMode==='ticket'\?'all':\(actualSession\.default_mailbox_id\|\|'all'\);state\.mailFolder='inbox';/);
+});
+
+test('mail list is paginated and can continue loading older rows', () => {
+  assert.match(listRoute, /limit: int = 100, offset: int = 0/);
+  assert.match(listRoute, /LIMIT \? OFFSET \?/);
+  assert.match(listRoute, /"has_more": has_more/);
+  assert.match(appSource, /loadMoreTickets\(button\)/);
+  assert.match(appSource, /id="loadMoreTickets"/);
+});
+
+test('session exposes the default mailbox so the first list request is scoped', () => {
+  assert.match(backendSource, /default_mailbox_id/);
+  assert.match(appSource, /state\.mailbox=state\.displayMode==='ticket'\?'all':\(d\.default_mailbox_id\|\|'all'\)/);
 });

@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from pydantic import BaseModel, EmailStr, Field
 from cryptography.fernet import Fernet, InvalidToken
 import pymysql
+from starlette.middleware.gzip import GZipMiddleware
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,6 +39,7 @@ ATTACHMENT_DIR = ROOT / "data" / "attachments"
 MAX_ATTACHMENT_BYTES = int(os.getenv("TICKET_MAX_ATTACHMENT_BYTES", str(20 * 1024 * 1024)))
 MAX_ATTACHMENTS_PER_MESSAGE = int(os.getenv("TICKET_MAX_ATTACHMENTS_PER_MESSAGE", "10"))
 app = FastAPI(title="PostPilot Ticket Desk")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 worker = None
 feishu_worker = None
 telegram_bridge = None
@@ -294,6 +296,9 @@ def init_db() -> None:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_tracking_token ON outbox(tracking_token) WHERE tracking_token IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_workspace ON mailboxes(workspace_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_ticket_unread ON messages(ticket_id, direction, is_read)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_unread_ticket ON messages(direction, is_read, ticket_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_mailbox_updated ON tickets(mailbox_id, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_mailbox_status ON tickets(mailbox_id, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_ai_category ON tickets(ai_category, updated_at DESC)")
         conn.execute("""CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY, message_id TEXT REFERENCES messages(id), outbox_id TEXT REFERENCES outbox(id),
@@ -1355,7 +1360,8 @@ def session_info(request: Request):
     context = current_context(request)
     with db() as conn:
         workspaces = [dict(x) for x in conn.execute("SELECT w.id,w.name,w.slug,m.role FROM workspaces w JOIN workspace_memberships m ON m.workspace_id=w.id WHERE m.user_id=? ORDER BY w.name", (context["id"],))]
-    return {"ok": True, "user": context, "workspaces": workspaces}
+        default_mailbox = conn.execute("SELECT id FROM mailboxes WHERE workspace_id=? AND enabled=1 ORDER BY name,id LIMIT 1", (context["workspace_id"],)).fetchone()
+    return {"ok": True, "user": context, "workspaces": workspaces, "default_mailbox_id": default_mailbox["id"] if default_mailbox else "all"}
 
 
 @app.post("/api/workspaces/switch")
@@ -1949,8 +1955,11 @@ def attach_message_files(conn: sqlite3.Connection, messages: list[dict]) -> list
 
 @app.get("/api/tickets")
 def list_tickets(request: Request, status: Optional[str] = None, mailbox: Optional[str] = None, tag: Optional[str] = None,
-                 q: Optional[str] = None, view: str = "all", priority: str = "all", category: str = "all", sort: str = "latest"):
+                 q: Optional[str] = None, view: str = "all", priority: str = "all", category: str = "all", sort: str = "latest",
+                 limit: int = 100, offset: int = 0):
     context = current_context(request)
+    page_limit = min(max(limit, 1), 250)
+    page_offset = max(offset, 0)
     sql = """SELECT t.*, m.name mailbox_name, m.email mailbox_email, m.color mailbox_color,
         COALESCE(unread_stats.unread, 0) unread
         FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id
@@ -1985,8 +1994,11 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
         sql += " ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 ELSE 2 END, t.updated_at DESC"
     else:
         sql += " ORDER BY t.updated_at DESC"
+    sql += " LIMIT ? OFFSET ?"
     with db() as conn:
-        tickets = [row_dict(x) for x in conn.execute(sql, params)]
+        tickets = [row_dict(x) for x in conn.execute(sql, [*params, page_limit + 1, page_offset])]
+        has_more = len(tickets) > page_limit
+        tickets = tickets[:page_limit]
         counts = {x["status"]: x["n"] for x in conn.execute("SELECT t.status,COUNT(*) n FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=? GROUP BY t.status", (context["workspace_id"],))}
         unread_messages = conn.execute("""SELECT COUNT(*) FROM messages msg JOIN tickets t ON t.id=msg.ticket_id
             JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=? AND msg.direction='inbound' AND msg.is_read=0""", (context["workspace_id"],)).fetchone()[0]
@@ -2003,7 +2015,7 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
     tag_options = list(dict.fromkeys([*allowed_tags, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag") in allowed_tags)]))
     allowed_categories = ai_categories_for_workspace(context["workspace_id"])
     category_options = list(dict.fromkeys([*allowed_categories, *(x for x in category_counts.keys() if x in allowed_categories)]))
-    return {"ok": True, "tickets": tickets, "counts": counts, "summary": {"unprocessed": counts.get("open", 0), "unread_messages": unread_messages}, "mailboxes": boxes, "tag_options": tag_options, "category_options": category_options, "category_counts": category_counts}
+    return {"ok": True, "tickets": tickets, "has_more": has_more, "next_offset": page_offset + len(tickets), "counts": counts, "summary": {"unprocessed": counts.get("open", 0), "unread_messages": unread_messages}, "mailboxes": boxes, "tag_options": tag_options, "category_options": category_options, "category_counts": category_counts}
 
 
 @app.get("/api/mail/inbound-cursor")
@@ -2393,7 +2405,7 @@ def index():
 def static(filename: str):
     if filename not in {"feishu-ui.js", "feishu.css", "feishu.js", "mobile.css", "mobile.js", "app.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "mail-client.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
         raise HTTPException(404)
-    return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "no-cache, must-revalidate"})
+    return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "public, max-age=300, stale-while-revalidate=86400"})
 
 
 import feishu
