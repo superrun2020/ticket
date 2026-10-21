@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS messages (
   open_count INTEGER NOT NULL DEFAULT 0, delivery_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ticket_time ON messages(ticket_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_ticket_unread ON messages(ticket_id, direction, is_read);
 CREATE TABLE IF NOT EXISTS attachments (
   id TEXT PRIMARY KEY, message_id TEXT REFERENCES messages(id), outbox_id TEXT REFERENCES outbox(id),
   ticket_id TEXT NOT NULL REFERENCES tickets(id), direction TEXT NOT NULL CHECK(direction IN ('inbound','outbound')),

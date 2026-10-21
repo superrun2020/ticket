@@ -207,8 +207,7 @@ renderList=function(){
   if(state.displayMode!=='ticket'){mailModeRenderList();return}
   const tickets=state.tickets||[];
   if(!tickets.length){$('#ticketList').innerHTML='<div class="empty mail-empty"><span>▣</span><h2>当前没有工单</h2><p>新邮件会自动建立工单。</p></div>';updateDisplayMode();return}
-  $('#ticketList').innerHTML=tickets.map(ticket=>`<article class="ticket-card ticket-mode-row ${ticket.id===state.selected?'active':''}" data-id="${esc(ticket.id)}"><div class="ticket-mode-top"><div class="customer-avatar">${esc(initials(ticket.customer_name||'?'))}</div><div><strong>${esc(ticket.customer_name||'未知客户')}</strong><small>${esc(ticket.customer_email||'')}</small></div><time class="time">${formatTime(ticket.updated_at)}</time></div><div class="ticket-mode-subject">${esc(ticket.subject||'(无主题)')}</div><div class="ticket-mode-preview">${esc(ticket.preview||'暂无邮件摘要')}</div><div class="ticket-mode-meta"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span class="priority ${ticket.priority}">${esc(priorityLabel[ticket.priority]||'普通')}</span><span>分类：${esc(ticket.ai_category||'待分类')}</span><span>负责人：${esc(ticket.assignee||'未分配')}</span></div></article>`).join('');
-  document.querySelectorAll('.ticket-mode-row').forEach(card=>card.onclick=()=>openTicket(card.dataset.id));
+  $('#ticketList').innerHTML=tickets.map(ticket=>`<article class="ticket-card ticket-mode-row ${ticket.id===state.selected?'active':''}" data-ticket-id="${esc(ticket.id)}" role="button" tabindex="0" aria-label="打开工单 ${esc(ticket.subject||'(无主题)')}"><div class="ticket-mode-top"><div class="customer-avatar">${esc(initials(ticket.customer_name||'?'))}</div><div><strong>${esc(ticket.customer_name||'未知客户')}</strong><small>${esc(ticket.customer_email||'')}</small></div><time class="time">${formatTime(ticket.updated_at)}</div><div class="ticket-mode-subject">${esc(ticket.subject||'(无主题)')}</div><div class="ticket-mode-preview">点击打开工单查看邮件正文</div><div class="ticket-mode-meta"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span class="priority ${ticket.priority}">${esc(priorityLabel[ticket.priority]||'普通')}</span><span>分类：${esc(ticket.ai_category||'待分类')}</span><span>负责人：${esc(ticket.assignee||'未分配')}</span></div></article>`).join('');
   updateDisplayMode();
 };
 const mailModeRenderNav=typeof renderNav==='function'?renderNav:null;
@@ -238,7 +237,7 @@ function updateMailClientNavigation(){
   const heading=$('header h1'),subtitle=$('header p'),search=$('#search');
   if(heading)heading.textContent=mailFolderTitle();
   if(subtitle)subtitle.textContent=state.mailbox!=='all'?(state.mailboxes?.find(x=>x.id===state.mailbox)?.email||'当前邮箱'):'统一收件箱 · 邮件、附件与回复集中处理';
-  if(search)search.placeholder='搜索发件人、主题或邮件内容…';
+  if(search)search.placeholder='搜索发件人或主题…';
 }
 function resetSelectedTicketView(){
   state.selected=null;
@@ -278,10 +277,27 @@ function renderList(){
     updateMailClientNavigation();
     return;
   }
-  $('#ticketList').innerHTML=tickets.map(ticket=>`<article class="ticket-card mail-row ${ticket.id===state.selected?'active':''} ${ticket.unread?'is-unread':''}" data-id="${esc(ticket.id)}"><div class="mail-row-avatar">${esc(initials(ticket.customer_name||ticket.customer_email||'?'))}</div><div class="mail-row-main"><div class="mail-row-top"><strong class="mail-sender">${esc(ticket.customer_name||ticket.customer_email||'未知发件人')}</strong>${ticket.unread?'<i class="unread" title="未读"></i>':''}<time class="time">${formatTime(ticket.updated_at)}</time></div><div class="mail-row-subject">${esc(ticket.subject||'(无主题)')}</div><div class="mail-row-preview">${esc(ticket.preview||'暂无邮件摘要')}</div><div class="mail-row-meta"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span>${esc(ticket.mailbox_name||'')}</span>${ticket.ai_category&&ticket.ai_category!=='待分类'?`<span>✦ ${esc(ticket.ai_category)}</span>`:''}<span class="mail-row-id">${esc(ticket.id)}</span></div></div></article>`).join('');
-  document.querySelectorAll('.mail-row').forEach(card=>card.onclick=()=>openTicket(card.dataset.id));
+  $('#ticketList').innerHTML=tickets.map(ticket=>`<article class="ticket-card mail-row ${ticket.id===state.selected?'active':''} ${ticket.unread?'is-unread':''}" data-ticket-id="${esc(ticket.id)}" role="button" tabindex="0" aria-label="打开邮件 ${esc(ticket.subject||'(无主题)')}"><div class="mail-row-avatar">${esc(initials(ticket.customer_name||ticket.customer_email||'?'))}</div><div class="mail-row-main"><div class="mail-row-top"><strong class="mail-sender">${esc(ticket.customer_name||ticket.customer_email||'未知发件人')}</strong>${ticket.unread?'<i class="unread" title="未读"></i>':''}<time class="time">${formatTime(ticket.updated_at)}</time></div><div class="mail-row-subject">${esc(ticket.subject||'(无主题)')}</div><div class="mail-row-preview">点击打开邮件查看正文</div><div class="mail-row-meta"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span>${esc(ticket.mailbox_name||'')}</span>${ticket.ai_category&&ticket.ai_category!=='待分类'?`<span>✦ ${esc(ticket.ai_category)}</span>`:''}<span class="mail-row-id">${esc(ticket.id)}</span></div></div></article>`).join('');
 }
 function emptyHtml(){return '<div class="empty mail-empty"><span>✉</span><h2>选择一封邮件</h2><p>从中间列表选择邮件，右侧查看正文并回复。</p></div>'}
+
+function bindTicketListInteractions(){
+  const list=$('#ticketList');
+  if(!list||list.dataset.ticketInteractions==='1')return;
+  list.dataset.ticketInteractions='1';
+  const openFromEvent=event=>{
+    const target=event.target;
+    const card=typeof target?.closest==='function'?target.closest('[data-ticket-id]'):null;
+    if(!card||!list.contains(card))return;
+    event.preventDefault();
+    void openTicket(card.dataset.ticketId).catch(()=>toast('邮件内容加载失败，请重试'));
+  };
+  list.addEventListener('click',openFromEvent);
+  list.addEventListener('keydown',event=>{
+    if(event.key==='Enter'||event.key===' '){openFromEvent(event)}
+  });
+}
+bindTicketListInteractions();
 
 document.querySelectorAll('[data-mail-folder]').forEach(button=>button.onclick=()=>{state.mailFolder=button.dataset.mailFolder;state.status='all';state.view='all';state.priority='all';state.mailbox=state.mailbox||'all';resetSelectedTicketView();void load().catch(()=>toast('邮件列表加载失败，请重试'))});
 document.querySelectorAll('[data-mail-unavailable]').forEach(button=>button.onclick=()=>toast('该文件夹需要邮件源提供对应目录，当前暂未接入'));

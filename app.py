@@ -293,6 +293,7 @@ def init_db() -> None:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_provider_id ON messages(provider_message_id) WHERE provider_message_id IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_tracking_token ON outbox(tracking_token) WHERE tracking_token IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_workspace ON mailboxes(workspace_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_ticket_unread ON messages(ticket_id, direction, is_read)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tickets_ai_category ON tickets(ai_category, updated_at DESC)")
         conn.execute("""CREATE TABLE IF NOT EXISTS attachments (
             id TEXT PRIMARY KEY, message_id TEXT REFERENCES messages(id), outbox_id TEXT REFERENCES outbox(id),
@@ -1951,9 +1952,15 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
                  q: Optional[str] = None, view: str = "all", priority: str = "all", category: str = "all", sort: str = "latest"):
     context = current_context(request)
     sql = """SELECT t.*, m.name mailbox_name, m.email mailbox_email, m.color mailbox_color,
-        (SELECT body FROM messages WHERE ticket_id=t.id ORDER BY created_at DESC LIMIT 1) preview,
-        (SELECT COUNT(*) FROM messages WHERE ticket_id=t.id AND direction='inbound' AND is_read=0) unread
-        FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=?"""
+        COALESCE(unread_stats.unread, 0) unread
+        FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id
+        LEFT JOIN (
+            SELECT ticket_id, COUNT(*) unread
+            FROM messages
+            WHERE direction='inbound' AND is_read=0
+            GROUP BY ticket_id
+        ) unread_stats ON unread_stats.ticket_id=t.id
+        WHERE m.workspace_id=?"""
     params: List[str] = [context["workspace_id"]]
     if status and status != "all":
         sql += " AND t.status=?"; params.append(status)
