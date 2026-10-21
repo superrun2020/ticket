@@ -1360,7 +1360,14 @@ def session_info(request: Request):
     context = current_context(request)
     with db() as conn:
         workspaces = [dict(x) for x in conn.execute("SELECT w.id,w.name,w.slug,m.role FROM workspaces w JOIN workspace_memberships m ON m.workspace_id=w.id WHERE m.user_id=? ORDER BY w.name", (context["id"],))]
-        default_mailbox = conn.execute("SELECT id FROM mailboxes WHERE workspace_id=? AND enabled=1 ORDER BY name,id LIMIT 1", (context["workspace_id"],)).fetchone()
+        default_mailbox = conn.execute("""SELECT m.id,MAX(msg.created_at) latest_message_at
+            FROM mailboxes m
+            LEFT JOIN tickets t ON t.mailbox_id=m.id
+            LEFT JOIN messages msg ON msg.ticket_id=t.id
+            WHERE m.workspace_id=? AND m.enabled=1
+            GROUP BY m.id
+            ORDER BY latest_message_at IS NULL,latest_message_at DESC,m.name,m.id
+            LIMIT 1""", (context["workspace_id"],)).fetchone()
     return {"ok": True, "user": context, "workspaces": workspaces, "default_mailbox_id": default_mailbox["id"] if default_mailbox else "all"}
 
 
