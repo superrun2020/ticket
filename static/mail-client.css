@@ -13,6 +13,9 @@ body { background: var(--mail-bg); color: var(--mail-text); }
 .brand { color: #292c35; padding-bottom: 20px; }
 .brand-mark { border-radius: 8px; background: linear-gradient(140deg, #6d76e8, #4c56be); }
 .workspace-switcher { background: #f7f8fb; border-color: #e0e3eb; color: #565b68; }
+.mailbox-quick-switcher { display: grid; gap: 5px; margin: -2px 4px 12px; color: var(--mail-muted); font-size: 10px; }
+.mailbox-quick-switcher select { width: 100%; min-width: 0; height: 36px; padding: 0 9px; border: 1px solid #e0e3eb; border-radius: 7px; background: #f7f8fb; color: #565b68; font: inherit; }
+.mailbox-quick-switcher select:disabled { opacity: .65; cursor: wait; }
 .compose { background: #e65d4f; box-shadow: 0 5px 13px rgba(230, 93, 79, .18); }
 .nav-title { color: #9a9eaa; margin-top: 22px; }
 .nav-item { color: #636875; }
