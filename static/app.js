@@ -172,9 +172,27 @@ function ensureDisplayModeSwitcher(){
     const search=$('.search');
     actions.insertBefore(switcher,search||actions.firstChild);
   }
+  if(!switcher.dataset||typeof switcher.querySelectorAll!=='function')return;
   if(switcher.dataset.bound==='1')return;
   switcher.dataset.bound='1';
-  switcher.querySelectorAll('[data-display-mode]').forEach(button=>button.onclick=()=>{state.displayMode=button.dataset.displayMode;state.mailFolder=state.displayMode==='mail'?'inbox':'workflow';state.status='all';state.view='all';document.body.dataset.displayMode=state.displayMode;updateMailClientNavigation();renderList()});
+  switcher.querySelectorAll('[data-display-mode]').forEach(button=>button.onclick=event=>{
+    event.preventDefault();
+    event.stopPropagation();
+    const nextMode=button.dataset.displayMode;
+    if(state.displayMode===nextMode){updateDisplayMode();return}
+    state.displayMode=nextMode;
+    state.mailFolder=nextMode==='mail'?'inbox':'workflow';
+    state.status='all';
+    state.view='all';
+    state.priority='all';
+    state.tag='all';
+    state.mailbox=nextMode==='mail'?(state.mailboxes?.[0]?.id||'all'):'all';
+    listRequestSequence++;
+    resetSelectedTicketView();
+    updateDisplayMode();
+    $('#ticketList').innerHTML='<div class="loading">正在切换视图…</div>';
+    void load().catch(()=>toast('视图切换失败，请重试'));
+  });
 }
 function updateDisplayMode(){
   ensureDisplayModeSwitcher();
@@ -193,9 +211,9 @@ renderList=function(){
   document.querySelectorAll('.ticket-mode-row').forEach(card=>card.onclick=()=>openTicket(card.dataset.id));
   updateDisplayMode();
 };
-const mailModeRenderNav=renderNav;
-renderNav=function(data){mailModeRenderNav(data);updateDisplayMode()};
-ensureDisplayModeSwitcher();
+const mailModeRenderNav=typeof renderNav==='function'?renderNav:null;
+renderNav=function(data){if(mailModeRenderNav)mailModeRenderNav(data);updateDisplayMode()};
+if(typeof document!=='undefined'&&typeof $==='function')ensureDisplayModeSwitcher();
 async function refreshReplyRecipients(id){const anchor=replyComposerState.parentMessageId,editorEpoch=replyEditorEpoch,generation=workspaceGeneration,workspace=state.session?.user.workspace_id;const suffix=`?parent_message_id=${encodeURIComponent(anchor||'')}`;const preview=await api(`/api/tickets/${id}/reply-recipients${suffix}`);if(state.selected!==id||replyComposerState.ticketId!==id||editorEpoch!==replyEditorEpoch||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id)return;replyComposerState.preview=preview;replyComposerState.parentMessageId=preview.parent_message_id;applyReplyMode(replyComposerState.mode);toast('收件人已刷新')}
 function applyReplyMode(mode){replyComposerState.mode=mode;const recipients=replyComposerState.preview?.[mode]||{to:[],cc:[]};$('#replyTo').value=recipients.to.join(', ');$('#replyCc').value=recipients.cc.join(', ');const hint=$('#replyRecipientHint');if(hint)hint.textContent=replyComposerState.preview?.historical_metadata_unavailable?'历史邮件缺少原始 To/Cc/Reply-To 元数据，已安全回退到发件人；可手动添加收件人。':'';if(typeof document!=='undefined')document.querySelectorAll('[data-reply-mode]').forEach(button=>button.classList.toggle('selected',button.dataset.replyMode===mode))}
 async function sendReply(id){const body=$('#replyText').value.trim(),to=$('#replyTo').value.trim();if(!body)return toast('请输入回复内容');if(!to)return toast('请填写收件人');const editorEpoch=replyEditorEpoch,workspace=state.session?.user.workspace_id,button=$('#sendReply');button.disabled=true;const form=new FormData();form.append('body',body);form.append('to',to);form.append('cc',$('#replyCc').value.trim());form.append('parent_message_id',replyComposerState.parentMessageId||'');form.append('close_after_send',$('#closeAfter').checked?'true':'false');attachmentState.reply.forEach(file=>form.append('files',file,file.name));let error;try{await api(`/api/tickets/${id}/reply-with-attachments`,{method:'POST',body:form})}catch(caught){error=caught}await finishReplyResult({id,editorEpoch,workspace,queued:!error,error})}
@@ -222,6 +240,13 @@ function updateMailClientNavigation(){
   if(subtitle)subtitle.textContent=state.mailbox!=='all'?(state.mailboxes?.find(x=>x.id===state.mailbox)?.email||'当前邮箱'):'统一收件箱 · 邮件、附件与回复集中处理';
   if(search)search.placeholder='搜索发件人、主题或邮件内容…';
 }
+function resetSelectedTicketView(){
+  state.selected=null;
+  const detail=$('#detail');
+  detail.classList.remove('mobile-open');
+  detail.innerHTML=emptyHtml();
+  document.body.classList.remove('mobile-detail-visible');
+}
 function renderNav(d){
   const total=Object.values(d.counts||{}).reduce((a,b)=>a+b,0);
   $('#allCount').textContent=total;
@@ -234,14 +259,17 @@ function renderNav(d){
   $('#categoryChips').innerHTML=categories.map(x=>`<button class="category-chip ${state.category===x?'active':''}" data-category="${esc(x)}">${x==='all'?'✦ 全部':esc(x)} <b>${x==='all'?total:(d.category_counts?.[x]||0)}</b></button>`).join('');
   document.querySelectorAll('[data-category]').forEach(button=>button.onclick=()=>{state.category=button.dataset.category;state.mailFolder='workflow';load()});
   $('#tagNav').innerHTML=(d.tag_options||[]).filter(x=>x!=='未分类').map(tag=>`<button class="nav-item tag-filter ${state.tag===tag?'active':''}" data-tag="${esc(tag)}"><span>🏷</span>${esc(tag)}</button>`).join('');
-  $('#mailboxNav').innerHTML=(d.mailboxes||[]).map(mailbox=>`<div class="mailbox-row ${state.mailbox===mailbox.id?'active':''}"><button class="nav-item mailbox ${state.mailbox===mailbox.id?'active':''}" data-mailbox="${esc(mailbox.id)}" title="${esc(mailbox.email)}"><i class="dot" style="background:${esc(mailbox.color||'#8b84dc')}"></i><span>${esc(mailbox.name)}<small>${esc(mailbox.email)} · ${esc(mailbox.mailbox_tag||'未分类')}</small></span><b>${mailbox.ticket_count||0}</b></button>${state.mailbox===mailbox.id?`<button type="button" class="mailbox-refresh" data-mailbox-refresh aria-label="刷新 ${esc(mailbox.name)} 邮箱列表" title="刷新 ${esc(mailbox.name)} 邮箱列表">↻</button>`:''}</div>`).join('');
-  document.querySelectorAll('[data-mailbox]').forEach(button=>button.onclick=()=>{state.mailbox=state.mailbox===button.dataset.mailbox?'all':button.dataset.mailbox;state.tag='all';state.mailFolder='inbox';load()});
+  const availableMailboxes=(d.mailboxes||[]).filter(mailbox=>mailbox.enabled);
+  $('#mailboxNav').innerHTML=availableMailboxes.map(mailbox=>`<div class="mailbox-row ${state.mailbox===mailbox.id?'active':''}"><button class="nav-item mailbox ${state.mailbox===mailbox.id?'active':''}" data-mailbox="${esc(mailbox.id)}" title="${esc(mailbox.email)}"><i class="dot" style="background:${esc(mailbox.color||'#8b84dc')}"></i><span>${esc(mailbox.name)}<small>${esc(mailbox.email)} · ${esc(mailbox.mailbox_tag||'未分类')}</small></span><b>${mailbox.ticket_count||0}</b></button>${state.mailbox===mailbox.id?`<button type="button" class="mailbox-refresh" data-mailbox-refresh aria-label="刷新 ${esc(mailbox.name)} 邮箱列表" title="刷新 ${esc(mailbox.name)} 邮箱列表">↻</button>`:''}</div>`).join('');
+  document.querySelectorAll('[data-mailbox]').forEach(button=>button.onclick=()=>{state.mailbox=button.dataset.mailbox;state.tag='all';state.mailFolder='inbox';resetSelectedTicketView();void load().catch(()=>toast('邮箱列表加载失败，请重试'))});
   document.querySelectorAll('[data-mailbox-refresh]').forEach(button=>button.onclick=()=>refreshSelectedMailbox(button));
   document.querySelectorAll('[data-tag]').forEach(button=>button.onclick=()=>{state.tag=state.tag===button.dataset.tag?'all':button.dataset.tag;state.mailbox='all';state.mailFolder='workflow';load()});
   updateMailClientNavigation();
 }
 function renderList(){
   let tickets=state.tickets||[];
+  if(state.displayMode!=='ticket'&&state.mailbox==='all'&&state.mailboxes?.length)state.mailbox=state.mailboxes[0].id;
+  if(state.displayMode!=='ticket'&&state.mailbox!=='all')tickets=tickets.filter(ticket=>ticket.mailbox_id===state.mailbox);
   if(state.mailFolder==='unread')tickets=tickets.filter(ticket=>ticket.unread);
   if(state.mailFolder==='flagged')tickets=tickets.filter(ticket=>['high','urgent'].includes(ticket.priority));
   if(!tickets.length){
@@ -255,13 +283,24 @@ function renderList(){
 }
 function emptyHtml(){return '<div class="empty mail-empty"><span>✉</span><h2>选择一封邮件</h2><p>从中间列表选择邮件，右侧查看正文并回复。</p></div>'}
 
-document.querySelectorAll('[data-mail-folder]').forEach(button=>button.onclick=()=>{state.mailFolder=button.dataset.mailFolder;state.status='all';state.view='all';state.priority='all';state.mailbox=state.mailbox||'all';load()});
+document.querySelectorAll('[data-mail-folder]').forEach(button=>button.onclick=()=>{state.mailFolder=button.dataset.mailFolder;state.status='all';state.view='all';state.priority='all';state.mailbox=state.mailbox||'all';resetSelectedTicketView();void load().catch(()=>toast('邮件列表加载失败，请重试'))});
 document.querySelectorAll('[data-mail-unavailable]').forEach(button=>button.onclick=()=>toast('该文件夹需要邮件源提供对应目录，当前暂未接入'));
 document.querySelectorAll('[data-status]').forEach(button=>button.addEventListener('click',()=>{state.mailFolder='workflow';updateMailClientNavigation()}));
 
 openTicket=async function(id){
   const editorEpoch=++replyEditorEpoch,generation=workspaceGeneration,workspace=state.session?.user.workspace_id;
-  state.selected=id;renderList();const d=await api('/api/tickets/'+id);const ticket=d.ticket;
+  state.selected=id;
+  document.querySelectorAll('.ticket-card').forEach(card=>card.classList.toggle('active',card.dataset.id===String(id)));
+  $('#detail').classList.add('mobile-open');
+  $('#detail').innerHTML='<div class="empty detail-loading"><span>✉</span><h2>正在打开邮件</h2><p>正在载入邮件正文…</p></div>';
+  let d;
+  try{d=await api('/api/tickets/'+id)}catch(error){
+    if(state.selected!==id||editorEpoch!==replyEditorEpoch||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id)return;
+    $('#detail').innerHTML='<div class="empty detail-loading"><span>!</span><h2>邮件内容加载失败</h2><p>请稍后重试或刷新列表。</p></div>';
+    toast('邮件内容加载失败，请重试');
+    return;
+  }
+  const ticket=d.ticket;
   if(state.selected!==id||editorEpoch!==replyEditorEpoch||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id)return;
   replyComposerState={ticketId:id,parentMessageId:d.reply_recipients.parent_message_id,mode:'reply',preview:d.reply_recipients};
   $('#detail').classList.add('mobile-open');
