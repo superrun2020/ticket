@@ -2384,7 +2384,7 @@ def index():
 
 @app.get("/static/{filename}")
 def static(filename: str):
-    if filename not in {"feishu-ui.js", "feishu.css", "feishu.js", "mobile.css", "mobile.js", "app.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
+    if filename not in {"feishu-ui.js", "feishu.css", "feishu.js", "mobile.css", "mobile.js", "app.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "mail-client.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
         raise HTTPException(404)
     return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "no-cache, must-revalidate"})
 

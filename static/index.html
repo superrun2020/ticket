@@ -2,36 +2,47 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>GeekForest · 用户工单系统</title><link rel="icon" href="/static/favicon.ico"><link rel="apple-touch-icon" href="/static/apple-touch-icon.png"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/overrides.css?v=20260916-reply-all-1"><link rel="stylesheet" href="/static/settings.css?v=20260831-mail-domain-status-1"><link rel="stylesheet" href="/static/scrollfix.css"><link rel="stylesheet" href="/static/workspaces.css?v=20260831-workspace-create-1"><link rel="stylesheet" href="/static/tags.css"><link rel="stylesheet" href="/static/branding.css?v=20260830-ticket-labels-1"><link rel="stylesheet" href="/static/label-picker.css?v=20260830-2"><link rel="stylesheet" href="/static/translate-button.css?v=20260828-14">
+  <title>GeekForest Mail · 企业邮件</title><link rel="icon" href="/static/favicon.ico"><link rel="apple-touch-icon" href="/static/apple-touch-icon.png"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/overrides.css?v=20261021-mail-client-1"><link rel="stylesheet" href="/static/settings.css?v=20260831-mail-domain-status-1"><link rel="stylesheet" href="/static/scrollfix.css"><link rel="stylesheet" href="/static/workspaces.css?v=20260831-workspace-create-1"><link rel="stylesheet" href="/static/tags.css"><link rel="stylesheet" href="/static/branding.css?v=20260830-ticket-labels-1"><link rel="stylesheet" href="/static/label-picker.css?v=20260830-2"><link rel="stylesheet" href="/static/translate-button.css?v=20260828-14">
   <link rel="stylesheet" href="/static/mobile.css?v=20261015-1">
   <link rel="stylesheet" href="/static/feishu.css?v=20261015-1">
+  <link rel="stylesheet" href="/static/mail-client.css?v=20261021-mail-client-2">
 </head>
 <body>
   <div class="mobile-bar" id="mobileBar"><button type="button" id="mobileMenu" aria-controls="mainNavigation" aria-expanded="false">☰ 导航</button><button type="button" id="mobileBack" hidden>← 返回列表</button><button type="button" id="mobileResume" hidden>继续编辑 →</button></div>
   <div id="mobileBackdrop" class="mobile-backdrop" hidden></div>
-  <aside class="sidebar" id="mainNavigation" aria-label="工作区与工单导航">
+  <aside class="sidebar" id="mainNavigation" aria-label="企业邮箱导航">
     <button type="button" id="mobileClose" class="mobile-close" aria-label="关闭导航">× 关闭导航</button>
-    <div class="brand"><img class="brand-mark" src="/static/ticket-logo.png" alt=""><span>GeekForest</span></div><select id="workspaceSwitcher" class="workspace-switcher" aria-label="当前工作区"></select>
+    <div class="brand"><img class="brand-mark" src="/static/ticket-logo.png" alt=""><span>GeekForest Mail</span></div><select id="workspaceSwitcher" class="workspace-switcher" aria-label="当前工作区"></select>
     <button class="compose" id="composeButton" type="button">＋ 写邮件</button>
     <nav>
-      <p class="nav-title">工作台</p>
-      <button class="nav-item active" data-status="all"><span>▣</span>所有工单 <b id="allCount">0</b></button>
-      <button class="nav-item" data-status="open"><span>◉</span>待处理 <b id="openCount">0</b></button>
-      <button class="nav-item" data-status="pending"><span>◷</span>等待客户 <b id="pendingCount">0</b></button>
-      <button class="nav-item" data-status="resolved"><span>✓</span>已解决 <b id="resolvedCount">0</b></button>
+      <p class="nav-title">邮箱</p>
+      <button class="nav-item active" data-mail-folder="inbox" id="mailInboxNav"><span>▣</span>收件箱 <b id="allCount">0</b></button>
+      <button class="nav-item" data-mail-folder="unread" id="mailUnreadNav"><span>●</span>未读邮件 <b id="unreadFolderCount">0</b></button>
+      <button class="nav-item" data-mail-folder="recent" id="mailRecentNav"><span>◷</span>最近查看</button>
+      <button class="nav-item" data-mail-folder="flagged" id="mailFlaggedNav"><span>⚑</span>红旗邮件</button>
+      <button class="nav-item mail-folder-placeholder" data-mail-unavailable="drafts"><span>□</span>草稿箱</button>
+      <button class="nav-item mail-folder-placeholder" data-mail-unavailable="sent"><span>➤</span>已发送</button>
+      <button class="nav-item mail-folder-placeholder" data-mail-unavailable="archive"><span>▱</span>归档</button>
+      <button class="nav-item mail-folder-placeholder" data-mail-unavailable="spam"><span>⊘</span>垃圾邮件</button>
+      <p class="nav-title mailbox-title">邮箱账户</p><div id="mailboxNav"></div>
+      <p class="nav-title">工单视图</p>
+      <button class="nav-item workflow-nav" data-status="all"><span>▣</span>全部工单 <b id="allTicketCount">0</b></button>
+      <button class="nav-item workflow-nav" data-status="open"><span>◉</span>待处理 <b id="openCount">0</b></button>
+      <button class="nav-item workflow-nav" data-status="pending"><span>◷</span>等待回复 <b id="pendingCount">0</b></button>
+      <button class="nav-item workflow-nav" data-status="resolved"><span>✓</span>已解决 <b id="resolvedCount">0</b></button>
       <button class="nav-item admin-entry" id="userAdminNav" hidden><span>♧</span>用户与工作区</button>
       <button class="nav-item admin-entry" id="googleMailboxNav" hidden><span>G</span>Google 邮箱</button>
       <button class="nav-item admin-entry" id="mailboxAdminNav" hidden><span>✉</span>邮箱管理</button>
       <button class="nav-item admin-entry" id="mailServiceNav" hidden><span>@</span>邮件、域名与邮箱设置</button>
       <button class="nav-item admin-entry" id="telegramNav" hidden><span>◉</span>Telegram 接入</button>
       <button class="nav-item" id="feishuSettings" type="button">飞书绑定与通知</button>
-      <p class="nav-title">邮箱标签</p><div id="tagNav"></div>
-      <p class="nav-title mailbox-title">邮箱</p><div id="mailboxNav"></div>
+      <p class="nav-title">标签</p><div id="tagNav"></div>
     </nav>
     <button class="profile" id="logoutButton" title="退出登录"><div class="avatar" id="profileAvatar">O</div><div><strong id="profileName">Oliver</strong><small id="profileRole">管理员</small></div><span>退出</span></button>
   </aside>
   <main>
-    <header><div><h1>所有工单</h1><p>集中处理每一个客户对话</p></div><div class="header-actions"><div class="refresh-tools"><button class="tool-button" id="refreshTickets" type="button">刷新工单列表</button><small id="refreshStatus" role="status">尚未刷新</small></div><label class="alert-toggle"><input id="mailSoundToggle" type="checkbox"> 新邮件声音</label><button class="tool-button" id="notificationPermission" type="button">开启浏览器通知</button><div class="mail-metrics"><span>待处理 <b id="unprocessedMetric">0</b></span><span>未读邮件 <b id="unreadMetric">0</b></span></div><label class="search">⌕ <input id="search" placeholder="搜索工单、客户…"></label><button class="icon-btn" id="mailboxTagsButton" title="邮箱标签管理">🏷</button><button class="icon-btn" id="aiSettingsButton" title="AI 设置">⚙</button><button class="icon-btn" id="userAdminButton" title="账户管理">♧</button></div></header>
+    <header><div><h1>收件箱</h1><p>统一收件箱 · 邮件、附件与回复集中处理</p></div><div class="header-actions"><div class="refresh-tools"><button class="tool-button" id="refreshTickets" type="button">刷新邮件</button><small id="refreshStatus" role="status">尚未刷新</small></div><label class="alert-toggle"><input id="mailSoundToggle" type="checkbox"> 新邮件声音</label><button class="tool-button" id="notificationPermission" type="button">开启浏览器通知</button><div class="mail-metrics"><span>待处理 <b id="unprocessedMetric">0</b></span><span>未读邮件 <b id="unreadMetric">0</b></span></div><label class="search">⌕ <input id="search" placeholder="搜索发件人、主题或邮件内容…"></label><button class="icon-btn" id="mailboxTagsButton" title="邮箱标签管理">🏷</button><button class="icon-btn" id="aiSettingsButton" title="AI 设置">⚙</button><button class="icon-btn" id="userAdminButton" title="账户管理">♧</button></div></header>
+    <div class="mode-bar" aria-label="工作模式"><span class="mode-bar-label">工作模式</span><div class="display-mode-switcher" id="displayModeSwitcher" aria-label="选择工作模式"><button type="button" data-display-mode="mail">邮件模式</button><button type="button" data-display-mode="ticket">工单模式</button></div><span class="mode-bar-hint">可随时切换查看方式</span></div>
     <section class="toolbar"><div class="tabs"><button class="selected" data-view="all">全部</button><button data-view="mine">我的工单</button><button data-view="unassigned">未分配</button></div><div class="category-chips" id="categoryChips" aria-label="AI 标签"></div><div><select class="filter" id="sortFilter" aria-label="排序"><option value="latest">⇅ 最新动态</option><option value="oldest">⇅ 最早动态</option><option value="priority">↑ 优先级</option></select><select class="filter" id="priorityFilter" aria-label="优先级筛选"><option value="all">☷ 全部优先级</option><option value="urgent">紧急</option><option value="high">高优先级</option><option value="normal">普通</option></select></div></section>
     <section class="workspace">
       <div class="ticket-list" id="ticketList"><div class="loading">正在载入工单…</div></div>
@@ -57,7 +68,7 @@
   <dialog id="mailboxTagsDialog" class="settings-dialog tag-dialog"><form method="dialog"><div class="settings-head"><div><small>MAILBOX LABELS</small><h2>邮箱标签与汇总</h2></div><button value="cancel" class="dialog-close">×</button></div><div id="tagSummary" class="tag-summary"></div><div id="mailboxTagList" class="mailbox-tag-list"></div><div id="tagAiResult" class="tag-ai-result"></div></form></dialog>
   <dialog id="mailboxAdminDialog" class="settings-dialog mail-service-dialog"><div class="mail-service-shell"><div class="settings-head"><div><small>MAILBOX ADMIN</small><h2>邮箱管理</h2><p>统一查看所有邮箱、复制密码和 SMTP/IMAP 接入参数。</p></div><button type="button" class="dialog-close" id="closeMailboxAdmin">×</button></div><div id="mailboxAdminContent" class="mail-service-content"></div></div></dialog>
   <dialog id="mailServiceDialog" class="settings-dialog mail-service-dialog"><div class="mail-service-shell"><div class="settings-head"><div><small>MAIL2 ADMIN</small><h2>邮件、域名与邮箱设置</h2><p>统一管理 Mail2 邮件服务，并查看工单接入状态。</p></div><button type="button" class="dialog-close" id="closeMailService">×</button></div><div class="mail-service-toolbar"><div id="mailServiceHealth" class="service-health"></div><button type="button" class="tool-button" id="openAiFromSettings">AI 设置</button><button type="button" class="tool-button" id="syncMailService">同步 Mail2</button></div><div class="mail-service-tabs"><button type="button" class="active" data-mail-service-tab="mailboxes">邮箱</button><button type="button" data-mail-service-tab="domains">域名</button><button type="button" data-mail-service-tab="create-mailbox">新增邮箱</button><button type="button" data-mail-service-tab="create-domain">新增域名</button></div><div id="mailServiceContent" class="mail-service-content"></div></div></dialog>
-  <script src="/static/mail-refresh.js?v=20260915-1"></script><script src="/static/app.js?v=20260916-reply-all-1"></script>
+  <script src="/static/mail-refresh.js?v=20260915-1"></script><script src="/static/app.js?v=20261021-mode-switcher-2"></script>
   <script src="/static/mobile.js?v=20261015-1"></script>
   <script src="/static/feishu.js?v=20261015-1"></script><script src="/static/feishu-ui.js?v=20261015-1"></script>
 </body></html>

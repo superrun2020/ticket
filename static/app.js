@@ -158,6 +158,44 @@ openTicket=async function(id){
   create.onclick=()=>saveCategory(search.value);$('#markNoReply').onclick=()=>markNoReply(id);$('#replyAttachmentButton').onclick=()=>$('#replyAttachmentInput').click();setupAttachmentPicker('reply','#replyText','#replyAttachmentInput');
   $('#sendReply').onclick=()=>sendReply(id);$('#suggestReply').onclick=()=>suggestReply(id);$('#translateTicket').onclick=()=>translateLatestIncoming($('#translateTicket'));document.querySelectorAll('[data-translate]').forEach(b=>b.onclick=()=>translateReply(b.dataset.translate,b));$('#analyzeTicket').onclick=()=>analyzeTicket(id);
 }
+
+state.displayMode=state.displayMode||'mail';
+function ensureDisplayModeSwitcher(){
+  const actions=$('.header-actions');
+  if(!actions)return;
+  let switcher=$('.display-mode-switcher');
+  if(!switcher){
+    switcher=document.createElement('div');
+    switcher.className='display-mode-switcher';
+    switcher.setAttribute('aria-label','选择工作模式');
+    switcher.innerHTML='<button type="button" data-display-mode="mail">邮件模式</button><button type="button" data-display-mode="ticket">工单模式</button>';
+    const search=$('.search');
+    actions.insertBefore(switcher,search||actions.firstChild);
+  }
+  if(switcher.dataset.bound==='1')return;
+  switcher.dataset.bound='1';
+  switcher.querySelectorAll('[data-display-mode]').forEach(button=>button.onclick=()=>{state.displayMode=button.dataset.displayMode;state.mailFolder=state.displayMode==='mail'?'inbox':'workflow';state.status='all';state.view='all';document.body.dataset.displayMode=state.displayMode;updateMailClientNavigation();renderList()});
+}
+function updateDisplayMode(){
+  ensureDisplayModeSwitcher();
+  document.body.dataset.displayMode=state.displayMode;
+  document.querySelectorAll('[data-display-mode]').forEach(button=>button.classList.toggle('active',button.dataset.displayMode===state.displayMode));
+  const heading=$('header h1'),subtitle=$('header p');
+  updateMailClientNavigation();
+  if(state.displayMode==='ticket'){if(heading)heading.textContent='工单视图';if(subtitle)subtitle.textContent='按状态、优先级和分类处理客户事项'}
+}
+const mailModeRenderList=renderList;
+renderList=function(){
+  if(state.displayMode!=='ticket'){mailModeRenderList();return}
+  const tickets=state.tickets||[];
+  if(!tickets.length){$('#ticketList').innerHTML='<div class="empty mail-empty"><span>▣</span><h2>当前没有工单</h2><p>新邮件会自动建立工单。</p></div>';updateDisplayMode();return}
+  $('#ticketList').innerHTML=tickets.map(ticket=>`<article class="ticket-card ticket-mode-row ${ticket.id===state.selected?'active':''}" data-id="${esc(ticket.id)}"><div class="ticket-mode-top"><div class="customer-avatar">${esc(initials(ticket.customer_name||'?'))}</div><div><strong>${esc(ticket.customer_name||'未知客户')}</strong><small>${esc(ticket.customer_email||'')}</small></div><time class="time">${formatTime(ticket.updated_at)}</time></div><div class="ticket-mode-subject">${esc(ticket.subject||'(无主题)')}</div><div class="ticket-mode-preview">${esc(ticket.preview||'暂无邮件摘要')}</div><div class="ticket-mode-meta"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span class="priority ${ticket.priority}">${esc(priorityLabel[ticket.priority]||'普通')}</span><span>分类：${esc(ticket.ai_category||'待分类')}</span><span>负责人：${esc(ticket.assignee||'未分配')}</span></div></article>`).join('');
+  document.querySelectorAll('.ticket-mode-row').forEach(card=>card.onclick=()=>openTicket(card.dataset.id));
+  updateDisplayMode();
+};
+const mailModeRenderNav=renderNav;
+renderNav=function(data){mailModeRenderNav(data);updateDisplayMode()};
+ensureDisplayModeSwitcher();
 async function refreshReplyRecipients(id){const anchor=replyComposerState.parentMessageId,editorEpoch=replyEditorEpoch,generation=workspaceGeneration,workspace=state.session?.user.workspace_id;const suffix=`?parent_message_id=${encodeURIComponent(anchor||'')}`;const preview=await api(`/api/tickets/${id}/reply-recipients${suffix}`);if(state.selected!==id||replyComposerState.ticketId!==id||editorEpoch!==replyEditorEpoch||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id)return;replyComposerState.preview=preview;replyComposerState.parentMessageId=preview.parent_message_id;applyReplyMode(replyComposerState.mode);toast('收件人已刷新')}
 function applyReplyMode(mode){replyComposerState.mode=mode;const recipients=replyComposerState.preview?.[mode]||{to:[],cc:[]};$('#replyTo').value=recipients.to.join(', ');$('#replyCc').value=recipients.cc.join(', ');const hint=$('#replyRecipientHint');if(hint)hint.textContent=replyComposerState.preview?.historical_metadata_unavailable?'历史邮件缺少原始 To/Cc/Reply-To 元数据，已安全回退到发件人；可手动添加收件人。':'';if(typeof document!=='undefined')document.querySelectorAll('[data-reply-mode]').forEach(button=>button.classList.toggle('selected',button.dataset.replyMode===mode))}
 async function sendReply(id){const body=$('#replyText').value.trim(),to=$('#replyTo').value.trim();if(!body)return toast('请输入回复内容');if(!to)return toast('请填写收件人');const editorEpoch=replyEditorEpoch,workspace=state.session?.user.workspace_id,button=$('#sendReply');button.disabled=true;const form=new FormData();form.append('body',body);form.append('to',to);form.append('cc',$('#replyCc').value.trim());form.append('parent_message_id',replyComposerState.parentMessageId||'');form.append('close_after_send',$('#closeAfter').checked?'true':'false');attachmentState.reply.forEach(file=>form.append('files',file,file.name));let error;try{await api(`/api/tickets/${id}/reply-with-attachments`,{method:'POST',body:form})}catch(caught){error=caught}await finishReplyResult({id,editorEpoch,workspace,queued:!error,error})}
@@ -169,3 +207,73 @@ async function openMailboxAdmin(){if(!state.session?.user?.is_admin)return toast
 async function copyText(text,message){await navigator.clipboard.writeText(text);toast(message)}
 $('#mailboxAdminNav').onclick=openMailboxAdmin;
 $('#closeMailboxAdmin').onclick=()=>$('#mailboxAdminDialog').close();
+
+// Mail-client presentation layer. It keeps the existing ticket APIs and actions,
+// but makes the primary workflow read like an inbox instead of a ticket queue.
+state.mailFolder=state.mailFolder||'inbox';
+document.title='GeekForest Mail · 企业邮件';
+
+function mailFolderTitle(){return ({inbox:'收件箱',unread:'未读邮件',recent:'最近查看',flagged:'红旗邮件',workflow:'工单视图'})[state.mailFolder]||'收件箱'}
+function updateMailClientNavigation(){
+  document.querySelectorAll('[data-mail-folder]').forEach(button=>button.classList.toggle('active',button.dataset.mailFolder===state.mailFolder));
+  document.querySelectorAll('.workflow-nav').forEach(button=>button.classList.toggle('active',state.mailFolder==='workflow'&&button.dataset.status===state.status));
+  const heading=$('header h1'),subtitle=$('header p'),search=$('#search');
+  if(heading)heading.textContent=mailFolderTitle();
+  if(subtitle)subtitle.textContent=state.mailbox!=='all'?(state.mailboxes?.find(x=>x.id===state.mailbox)?.email||'当前邮箱'):'统一收件箱 · 邮件、附件与回复集中处理';
+  if(search)search.placeholder='搜索发件人、主题或邮件内容…';
+}
+function renderNav(d){
+  const total=Object.values(d.counts||{}).reduce((a,b)=>a+b,0);
+  $('#allCount').textContent=total;
+  $('#allTicketCount').textContent=total;
+  $('#unreadFolderCount').textContent=d.summary?.unread_messages||0;
+  $('#unprocessedMetric').textContent=d.summary?.unprocessed||0;
+  $('#unreadMetric').textContent=d.summary?.unread_messages||0;
+  ['open','pending','resolved'].forEach(x=>{const node=$(`#${x}Count`);if(node)node.textContent=d.counts?.[x]||0});
+  const categories=['all',...(d.category_options||[])];
+  $('#categoryChips').innerHTML=categories.map(x=>`<button class="category-chip ${state.category===x?'active':''}" data-category="${esc(x)}">${x==='all'?'✦ 全部':esc(x)} <b>${x==='all'?total:(d.category_counts?.[x]||0)}</b></button>`).join('');
+  document.querySelectorAll('[data-category]').forEach(button=>button.onclick=()=>{state.category=button.dataset.category;state.mailFolder='workflow';load()});
+  $('#tagNav').innerHTML=(d.tag_options||[]).filter(x=>x!=='未分类').map(tag=>`<button class="nav-item tag-filter ${state.tag===tag?'active':''}" data-tag="${esc(tag)}"><span>🏷</span>${esc(tag)}</button>`).join('');
+  $('#mailboxNav').innerHTML=(d.mailboxes||[]).map(mailbox=>`<div class="mailbox-row ${state.mailbox===mailbox.id?'active':''}"><button class="nav-item mailbox ${state.mailbox===mailbox.id?'active':''}" data-mailbox="${esc(mailbox.id)}" title="${esc(mailbox.email)}"><i class="dot" style="background:${esc(mailbox.color||'#8b84dc')}"></i><span>${esc(mailbox.name)}<small>${esc(mailbox.email)} · ${esc(mailbox.mailbox_tag||'未分类')}</small></span><b>${mailbox.ticket_count||0}</b></button>${state.mailbox===mailbox.id?`<button type="button" class="mailbox-refresh" data-mailbox-refresh aria-label="刷新 ${esc(mailbox.name)} 邮箱列表" title="刷新 ${esc(mailbox.name)} 邮箱列表">↻</button>`:''}</div>`).join('');
+  document.querySelectorAll('[data-mailbox]').forEach(button=>button.onclick=()=>{state.mailbox=state.mailbox===button.dataset.mailbox?'all':button.dataset.mailbox;state.tag='all';state.mailFolder='inbox';load()});
+  document.querySelectorAll('[data-mailbox-refresh]').forEach(button=>button.onclick=()=>refreshSelectedMailbox(button));
+  document.querySelectorAll('[data-tag]').forEach(button=>button.onclick=()=>{state.tag=state.tag===button.dataset.tag?'all':button.dataset.tag;state.mailbox='all';state.mailFolder='workflow';load()});
+  updateMailClientNavigation();
+}
+function renderList(){
+  let tickets=state.tickets||[];
+  if(state.mailFolder==='unread')tickets=tickets.filter(ticket=>ticket.unread);
+  if(state.mailFolder==='flagged')tickets=tickets.filter(ticket=>['high','urgent'].includes(ticket.priority));
+  if(!tickets.length){
+    const message=state.mailFolder==='unread'?'当前没有未读邮件':state.mailFolder==='flagged'?'当前没有红旗邮件':'当前文件夹没有邮件';
+    $('#ticketList').innerHTML=`<div class="empty mail-empty"><span>✉</span><h2>${message}</h2><p>新邮件会自动同步到这里。</p></div>`;
+    updateMailClientNavigation();
+    return;
+  }
+  $('#ticketList').innerHTML=tickets.map(ticket=>`<article class="ticket-card mail-row ${ticket.id===state.selected?'active':''} ${ticket.unread?'is-unread':''}" data-id="${esc(ticket.id)}"><div class="mail-row-avatar">${esc(initials(ticket.customer_name||ticket.customer_email||'?'))}</div><div class="mail-row-main"><div class="mail-row-top"><strong class="mail-sender">${esc(ticket.customer_name||ticket.customer_email||'未知发件人')}</strong>${ticket.unread?'<i class="unread" title="未读"></i>':''}<time class="time">${formatTime(ticket.updated_at)}</time></div><div class="mail-row-subject">${esc(ticket.subject||'(无主题)')}</div><div class="mail-row-preview">${esc(ticket.preview||'暂无邮件摘要')}</div><div class="mail-row-meta"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span>${esc(ticket.mailbox_name||'')}</span>${ticket.ai_category&&ticket.ai_category!=='待分类'?`<span>✦ ${esc(ticket.ai_category)}</span>`:''}<span class="mail-row-id">${esc(ticket.id)}</span></div></div></article>`).join('');
+  document.querySelectorAll('.mail-row').forEach(card=>card.onclick=()=>openTicket(card.dataset.id));
+}
+function emptyHtml(){return '<div class="empty mail-empty"><span>✉</span><h2>选择一封邮件</h2><p>从中间列表选择邮件，右侧查看正文并回复。</p></div>'}
+
+document.querySelectorAll('[data-mail-folder]').forEach(button=>button.onclick=()=>{state.mailFolder=button.dataset.mailFolder;state.status='all';state.view='all';state.priority='all';state.mailbox=state.mailbox||'all';load()});
+document.querySelectorAll('[data-mail-unavailable]').forEach(button=>button.onclick=()=>toast('该文件夹需要邮件源提供对应目录，当前暂未接入'));
+document.querySelectorAll('[data-status]').forEach(button=>button.addEventListener('click',()=>{state.mailFolder='workflow';updateMailClientNavigation()}));
+
+openTicket=async function(id){
+  const editorEpoch=++replyEditorEpoch,generation=workspaceGeneration,workspace=state.session?.user.workspace_id;
+  state.selected=id;renderList();const d=await api('/api/tickets/'+id);const ticket=d.ticket;
+  if(state.selected!==id||editorEpoch!==replyEditorEpoch||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id)return;
+  replyComposerState={ticketId:id,parentMessageId:d.reply_recipients.parent_message_id,mode:'reply',preview:d.reply_recipients};
+  $('#detail').classList.add('mobile-open');
+  $('#detail').innerHTML=`<article class="mail-reader"><div class="mail-reader-toolbar"><button type="button" class="reader-icon" title="返回收件箱" aria-label="返回收件箱" id="readerBack">←</button><div class="reader-toolbar-divider"></div><button type="button" class="reader-icon" title="回复" aria-label="回复" onclick="document.querySelector('#replyText')?.focus()">↩</button><button type="button" class="reader-icon" title="转发" aria-label="转发">↪</button><button type="button" class="reader-icon" title="删除" aria-label="删除">⌫</button><button type="button" class="reader-icon" title="更多操作" aria-label="更多操作">•••</button><div class="reader-toolbar-spacer"></div><button class="tool-button" id="translateTicket">文 译为中文</button><button class="tool-button" id="analyzeTicket">✦ AI 整理</button><button class="tool-button archive-button" id="markNoReply">归档</button></div><div class="mail-reader-head"><div class="mail-subject-line"><div class="reader-avatar">${esc(initials(ticket.customer_name||ticket.customer_email||'?'))}</div><div class="mail-subject-copy"><h2>${esc(ticket.subject||'(无主题)')}</h2><div class="mail-labels"><span class="mail-label ${ticket.status}">${esc(statusLabel[ticket.status]||ticket.status)}</span><span>${esc(ticket.mailbox_name||'')}</span><span class="ticket-id">${esc(ticket.id)}</span></div></div><time>${formatTime(ticket.updated_at)}</time></div><div class="mail-address-line"><strong>${esc(ticket.customer_name||'未知发件人')}</strong><span>&lt;${esc(ticket.customer_email||'')}&gt;</span><span class="address-caption">发给 ${esc(ticket.mailbox_email||'')}</span></div><div class="reader-ticket-tools"><label>状态<select class="status-select" id="status"><option value="open">待处理</option><option value="pending">等待回复</option><option value="resolved">已解决</option></select></label><label>优先级<select class="status-select" id="priority"><option value="normal">普通</option><option value="high">高</option><option value="urgent">紧急</option></select></label>${categoryPickerMarkup(ticket)}</div></div><div id="aiPanel"></div><div class="conversation">${d.messages.map(messageHtml).join('')}</div><div class="reply-box"><div class="reply-top"><div class="reply-mode"><button type="button" class="tool-button selected" data-reply-mode="reply">回复</button><button type="button" class="tool-button" data-reply-mode="reply_all">回复全部</button><button type="button" class="tool-button" id="refreshReplyRecipients">刷新收件人</button></div><label>收件人<input id="replyTo" autocomplete="off" placeholder="多个地址用逗号分隔"></label><label>抄送<input id="replyCc" autocomplete="off" placeholder="可手动添加"></label><small id="replyRecipientHint"></small></div><textarea id="replyText" dir="auto" placeholder="写下回复…"></textarea><div class="attachment-picker"><input id="replyAttachmentInput" type="file" multiple hidden><button type="button" class="tool-button" id="replyAttachmentButton">📎 添加附件</button><div id="replyAttachmentList" class="picked-attachments"></div></div><div class="reply-foot"><div class="ai-tools"><button class="tool-button suggest-button" id="suggestReply">✦ AI 建议回复</button><button class="tool-button" data-translate="en">中 → 英文</button><button class="tool-button" data-translate="fa">中 → 波斯语</button><button class="tool-button" data-translate="ru">中 → 俄语</button></div><label><input type="checkbox" id="closeAfter"> 发送并归档</label><button class="send" id="sendReply">发送回复</button></div></div></article>`;
+  $('#readerBack').onclick=()=>{$('#detail').classList.remove('mobile-open');state.selected=null;$('#detail').innerHTML=emptyHtml();document.body.classList.remove('mobile-detail-visible')};
+  applyReplyMode('reply');document.querySelectorAll('[data-reply-mode]').forEach(button=>button.onclick=()=>applyReplyMode(button.dataset.replyMode));$('#refreshReplyRecipients').onclick=()=>refreshReplyRecipients(id);
+  $('#status').value=ticket.status;$('#priority').value=ticket.priority;$('#status').onchange=e=>patchTicket(id,{status:e.target.value});$('#priority').onchange=e=>patchTicket(id,{priority:e.target.value});
+  const trigger=$('#ticketCategoryTrigger'),popover=$('#ticketCategoryPopover'),search=$('#ticketCategorySearch'),create=$('#ticketCategoryCreate');
+  trigger.onclick=e=>{e.stopPropagation();popover.hidden=!popover.hidden;trigger.setAttribute('aria-expanded',String(!popover.hidden));if(!popover.hidden)search.focus()};popover.onclick=e=>e.stopPropagation();
+  const saveCategory=async value=>{value=value.trim();if(!value)return;trigger.disabled=true;try{await patchTicket(id,{ai_category:value},false);$('#ticketCategoryValue').textContent=value;$('#ticketCategorySource').textContent='人工调整 · AI 已学习';trigger.classList.toggle('spam',value==='疑似垃圾邮件');popover.hidden=true;trigger.setAttribute('aria-expanded','false');toast('标签已保存，AI 会学习本次调整')}finally{trigger.disabled=false}};
+  document.querySelectorAll('[data-ticket-category]').forEach(button=>button.onclick=()=>saveCategory(button.dataset.ticketCategory));
+  search.oninput=()=>{const value=search.value.trim(),lower=value.toLowerCase();document.querySelectorAll('[data-ticket-category]').forEach(button=>button.hidden=!button.dataset.ticketCategory.toLowerCase().includes(lower));const exists=state.categoryOptions.some(x=>x.toLowerCase()===lower);create.hidden=!value||exists;create.querySelector('span').textContent=value};
+  search.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();const value=search.value.trim();if(value)saveCategory(value)}if(e.key==='Escape'){popover.hidden=true;trigger.setAttribute('aria-expanded','false')}};create.onclick=()=>saveCategory(search.value);
+  $('#markNoReply').onclick=()=>markNoReply(id);$('#replyAttachmentButton').onclick=()=>$('#replyAttachmentInput').click();setupAttachmentPicker('reply','#replyText','#replyAttachmentInput');$('#sendReply').onclick=()=>sendReply(id);$('#suggestReply').onclick=()=>suggestReply(id);$('#translateTicket').onclick=()=>translateLatestIncoming($('#translateTicket'));document.querySelectorAll('[data-translate]').forEach(button=>button.onclick=()=>translateReply(button.dataset.translate,button));$('#analyzeTicket').onclick=()=>analyzeTicket(id);
+}
