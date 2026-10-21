@@ -130,6 +130,41 @@ def current_context(request: Request) -> dict:
     return context
 
 
+def mailbox_access_filter(context: dict, alias: str = "m") -> tuple[str, list[str]]:
+    """Return the server-side mailbox scope for the active user.
+
+    Users without explicit rows keep the existing workspace-wide behavior.
+    Once rows exist, only the listed mailboxes are visible and writable.
+    Administrators retain full access to their active workspace.
+    """
+    if context.get("is_admin"):
+        return "", []
+    return (
+        f""" AND (
+            NOT EXISTS (SELECT 1 FROM user_mailbox_access AS access_scope
+                       WHERE access_scope.user_id=?)
+            OR EXISTS (SELECT 1 FROM user_mailbox_access AS access_grant
+                       WHERE access_grant.user_id=? AND access_grant.mailbox_id={alias}.id)
+        )""",
+        [context["id"], context["id"]],
+    )
+
+
+def mailbox_access_allowed(conn: sqlite3.Connection, context: dict, mailbox_id: str) -> bool:
+    """Check a concrete mailbox for mutation or non-SQL access paths."""
+    if context.get("is_admin"):
+        return True
+    scoped = conn.execute(
+        "SELECT 1 FROM user_mailbox_access WHERE user_id=? LIMIT 1", (context["id"],)
+    ).fetchone()
+    if not scoped:
+        return True
+    return bool(conn.execute(
+        "SELECT 1 FROM user_mailbox_access WHERE user_id=? AND mailbox_id=?",
+        (context["id"], mailbox_id),
+    ).fetchone())
+
+
 def password_hash(password: str, salt: Optional[str] = None) -> str:
     salt_bytes = bytes.fromhex(salt) if salt else os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt_bytes, 210_000)
@@ -292,6 +327,10 @@ def init_db() -> None:
             for column, declaration in columns:
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+        conn.execute("""CREATE TABLE IF NOT EXISTS user_mailbox_access (
+            user_id TEXT NOT NULL REFERENCES users(id), mailbox_id TEXT NOT NULL REFERENCES mailboxes(id),
+            created_at TEXT NOT NULL, PRIMARY KEY(user_id, mailbox_id))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_user_mailbox_access_mailbox ON user_mailbox_access(mailbox_id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_provider_id ON messages(provider_message_id) WHERE provider_message_id IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_tracking_token ON outbox(tracking_token) WHERE tracking_token IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_workspace ON mailboxes(workspace_id)")
@@ -1004,8 +1043,9 @@ def _reply_preview(conn: sqlite3.Connection, ticket: sqlite3.Row, parent_message
 def reply_recipient_preview(ticket_id: str, request: Request, parent_message_id: Optional[str] = None,
                             parent_supplied: bool = False) -> dict:
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
-        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
+        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone()
         if not ticket:
             raise HTTPException(404, detail={"error": "TICKET_NOT_FOUND"})
         preview = _reply_preview(conn, ticket, parent_message_id, parent_supplied)
@@ -1358,16 +1398,17 @@ def logout():
 @app.get("/api/session")
 def session_info(request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
         workspaces = [dict(x) for x in conn.execute("SELECT w.id,w.name,w.slug,m.role FROM workspaces w JOIN workspace_memberships m ON m.workspace_id=w.id WHERE m.user_id=? ORDER BY w.name", (context["id"],))]
         default_mailbox = conn.execute("""SELECT m.id,MAX(msg.created_at) latest_message_at
             FROM mailboxes m
             LEFT JOIN tickets t ON t.mailbox_id=m.id
             LEFT JOIN messages msg ON msg.ticket_id=t.id
-            WHERE m.workspace_id=? AND m.enabled=1
+            WHERE m.workspace_id=? AND m.enabled=1""" + access_sql + """
             GROUP BY m.id
             ORDER BY latest_message_at IS NULL,latest_message_at DESC,m.name,m.id
-            LIMIT 1""", (context["workspace_id"],)).fetchone()
+            LIMIT 1""", (context["workspace_id"], *access_params)).fetchone()
     return {"ok": True, "user": context, "workspaces": workspaces, "default_mailbox_id": default_mailbox["id"] if default_mailbox else "all"}
 
 
@@ -1749,9 +1790,10 @@ def test_ai():
 @app.post("/api/tickets/{ticket_id}/analyze")
 def analyze_ticket(ticket_id: str, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
         ticket = conn.execute("""SELECT t.subject FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id
-            WHERE t.id=? AND m.workspace_id=?""", (ticket_id, context["workspace_id"])).fetchone()
+            WHERE t.id=? AND m.workspace_id=?""" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone()
         if not ticket:
             raise HTTPException(404, "Ticket not found")
         messages = list(conn.execute("SELECT direction,body FROM messages WHERE ticket_id=? ORDER BY created_at", (ticket_id,)))
@@ -1767,10 +1809,11 @@ def analyze_ticket(ticket_id: str, request: Request):
 @app.post("/api/tickets/{ticket_id}/suggest-reply")
 def suggest_ticket_reply(ticket_id: str, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
         ticket = conn.execute("""SELECT t.subject,t.ai_category,t.customer_name,m.name mailbox_name
             FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id
-            WHERE t.id=? AND m.workspace_id=?""", (ticket_id, context["workspace_id"])).fetchone()
+            WHERE t.id=? AND m.workspace_id=?""" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone()
         if not ticket:
             raise HTTPException(404, detail={"error": "TICKET_NOT_FOUND"})
         messages = list(conn.execute("SELECT direction,sender_name,body FROM messages WHERE ticket_id=? ORDER BY created_at", (ticket_id,)))
@@ -1967,6 +2010,7 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
     context = current_context(request)
     page_limit = min(max(limit, 1), 250)
     page_offset = max(offset, 0)
+    access_sql, access_params = mailbox_access_filter(context)
     sql = """SELECT t.*, m.name mailbox_name, m.email mailbox_email, m.color mailbox_color,
         COALESCE(unread_stats.unread, 0) unread
         FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id
@@ -1976,8 +2020,8 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
             WHERE direction='inbound' AND is_read=0
             GROUP BY ticket_id
         ) unread_stats ON unread_stats.ticket_id=t.id
-        WHERE m.workspace_id=?"""
-    params: List[str] = [context["workspace_id"]]
+        WHERE m.workspace_id=?""" + access_sql
+    params: List[str] = [context["workspace_id"], *access_params]
     if status and status != "all":
         sql += " AND t.status=?"; params.append(status)
     if mailbox and mailbox != "all":
@@ -2006,18 +2050,18 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
         tickets = [row_dict(x) for x in conn.execute(sql, [*params, page_limit + 1, page_offset])]
         has_more = len(tickets) > page_limit
         tickets = tickets[:page_limit]
-        counts = {x["status"]: x["n"] for x in conn.execute("SELECT t.status,COUNT(*) n FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=? GROUP BY t.status", (context["workspace_id"],))}
+        counts = {x["status"]: x["n"] for x in conn.execute("SELECT t.status,COUNT(*) n FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=?" + access_sql + " GROUP BY t.status", (context["workspace_id"], *access_params))}
         unread_messages = conn.execute("""SELECT COUNT(*) FROM messages msg JOIN tickets t ON t.id=msg.ticket_id
-            JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=? AND msg.direction='inbound' AND msg.is_read=0""", (context["workspace_id"],)).fetchone()[0]
+            JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=?""" + access_sql + " AND msg.direction='inbound' AND msg.is_read=0""", (context["workspace_id"], *access_params)).fetchone()[0]
         category_counts = {x["ai_category"]: x["n"] for x in conn.execute("""SELECT t.ai_category,COUNT(*) n FROM tickets t
-            JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=? GROUP BY t.ai_category""", (context["workspace_id"],))}
+            JOIN mailboxes m ON m.id=t.mailbox_id WHERE m.workspace_id=?""" + access_sql + " GROUP BY t.ai_category""", (context["workspace_id"], *access_params))}
         boxes = [row_dict(x) for x in conn.execute("""SELECT m.*,
             COUNT(DISTINCT t.id) ticket_count,
             COUNT(DISTINCT CASE WHEN msg.direction='inbound' AND msg.is_read=0 THEN msg.id END) unread_count,
             MAX(msg.created_at) latest_message_at
             FROM mailboxes m LEFT JOIN tickets t ON t.mailbox_id=m.id LEFT JOIN messages msg ON msg.ticket_id=t.id
-            WHERE m.workspace_id=? GROUP BY m.id
-            ORDER BY latest_message_at IS NULL, latest_message_at DESC, m.name""", (context["workspace_id"],))]
+            WHERE m.workspace_id=?""" + access_sql + """ GROUP BY m.id
+            ORDER BY latest_message_at IS NULL, latest_message_at DESC, m.name""", (context["workspace_id"], *access_params))]
     allowed_tags = mailbox_tags_for_workspace(context["workspace_id"])
     tag_options = list(dict.fromkeys([*allowed_tags, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag") in allowed_tags)]))
     allowed_categories = ai_categories_for_workspace(context["workspace_id"])
@@ -2029,20 +2073,21 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
 def inbound_message_cursor(request: Request, since: Optional[int] = None):
     """Read-only workspace feed used to notice mail already ingested into tickets."""
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     if since is not None and since < 0:
         raise HTTPException(422, detail={"error": "INVALID_CURSOR"})
     with db() as conn:
         if since is None:
             cursor = conn.execute("""SELECT COALESCE(MAX(msg.rowid),0) FROM messages msg
                 JOIN tickets t ON t.id=msg.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
-                WHERE m.workspace_id=? AND msg.direction='inbound'""", (context["workspace_id"],)).fetchone()[0]
+                WHERE m.workspace_id=?""" + access_sql + """ AND msg.direction='inbound'""", (context["workspace_id"], *access_params)).fetchone()[0]
             messages = []
         else:
             messages = [row_dict(row) for row in conn.execute("""SELECT msg.rowid cursor,msg.id,msg.ticket_id,
                 msg.sender_name,msg.created_at,t.subject
                 FROM messages msg JOIN tickets t ON t.id=msg.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
-                WHERE m.workspace_id=? AND msg.direction='inbound' AND msg.rowid>?
-                ORDER BY msg.rowid LIMIT 100""", (context["workspace_id"], since))]
+                WHERE m.workspace_id=?""" + access_sql + """ AND msg.direction='inbound' AND msg.rowid>?
+                ORDER BY msg.rowid LIMIT 100""", (context["workspace_id"], *access_params, since))]
             cursor = messages[-1]["cursor"] if messages else since
     return {"ok": True, "cursor": cursor, "messages": messages}
 
@@ -2050,11 +2095,12 @@ def inbound_message_cursor(request: Request, since: Optional[int] = None):
 @app.get("/api/mailbox-tags")
 def mailbox_tags(request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
-        boxes = [row_dict(x) for x in conn.execute("SELECT id,name,email,mailbox_tag,enabled FROM mailboxes WHERE workspace_id=? ORDER BY mailbox_tag,name", (context["workspace_id"],))]
+        boxes = [row_dict(x) for x in conn.execute("SELECT id,name,email,mailbox_tag,enabled FROM mailboxes WHERE workspace_id=?" + access_sql + " ORDER BY mailbox_tag,name", (context["workspace_id"], *access_params))]
         stats = [row_dict(x) for x in conn.execute("""SELECT m.mailbox_tag tag,COUNT(DISTINCT m.id) mailboxes,COUNT(DISTINCT t.id) tickets,
             SUM(CASE WHEN t.status='open' THEN 1 ELSE 0 END) open_tickets
-            FROM mailboxes m LEFT JOIN tickets t ON t.mailbox_id=m.id WHERE m.workspace_id=? GROUP BY m.mailbox_tag""", (context["workspace_id"],))]
+            FROM mailboxes m LEFT JOIN tickets t ON t.mailbox_id=m.id WHERE m.workspace_id=?""" + access_sql + " GROUP BY m.mailbox_tag""", (context["workspace_id"], *access_params))]
     allowed_tags = mailbox_tags_for_workspace(context["workspace_id"])
     options = list(dict.fromkeys([*allowed_tags, *(b["mailbox_tag"] for b in boxes if b.get("mailbox_tag") in allowed_tags)]))
     return {"ok": True, "options": options, "mailboxes": boxes, "stats": stats}
@@ -2065,6 +2111,8 @@ def update_mailbox_tag(mailbox_id: str, payload: MailboxTagIn, request: Request)
     context = current_context(request)
     mailbox_tag = ensure_workspace_mailbox_tag(context["workspace_id"], payload.tag)
     with db() as conn:
+        if not mailbox_access_allowed(conn, context, mailbox_id):
+            raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
         changed = conn.execute("UPDATE mailboxes SET mailbox_tag=? WHERE id=? AND workspace_id=?", (mailbox_tag, mailbox_id, context["workspace_id"])).rowcount
     if not changed:
         raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
@@ -2075,13 +2123,14 @@ def update_mailbox_tag(mailbox_id: str, payload: MailboxTagIn, request: Request)
 @app.post("/api/mailbox-tags/{tag}/analyze")
 def analyze_mailbox_tag(tag: str, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     if tag not in mailbox_tags_for_workspace(context["workspace_id"]):
         raise HTTPException(422, detail={"error": "INVALID_MAILBOX_TAG"})
     with db() as conn:
         rows = list(conn.execute("""SELECT t.id,t.subject,t.status,t.priority,m.email mailbox_email,msg.body,msg.created_at
             FROM messages msg JOIN tickets t ON t.id=msg.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
-            WHERE m.workspace_id=? AND m.mailbox_tag=? AND msg.direction='inbound'
-            ORDER BY msg.created_at DESC LIMIT 120""", (context["workspace_id"], tag)))
+            WHERE m.workspace_id=?""" + access_sql + """ AND m.mailbox_tag=? AND msg.direction='inbound'
+            ORDER BY msg.created_at DESC LIMIT 120""", (context["workspace_id"], *access_params, tag)))
     if not rows:
         return {"ok": True, "tag": tag, "analysis": "该标签下暂时没有可汇总的客户邮件。", "message_count": 0}
     source = "\n\n".join(f"[{r['id']}] {r['subject']} | {r['status']}/{r['priority']} | {r['mailbox_email']}\n{r['body']}" for r in rows)[:50_000]
@@ -2092,8 +2141,9 @@ def analyze_mailbox_tag(tag: str, request: Request):
 @app.get("/api/tickets/{ticket_id}")
 def get_ticket(ticket_id: str, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
-        row = conn.execute("SELECT t.*,m.name mailbox_name,m.email mailbox_email,m.color mailbox_color FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
+        row = conn.execute("SELECT t.*,m.name mailbox_name,m.email mailbox_email,m.color mailbox_color FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone()
         if not row:
             raise HTTPException(404, "Ticket not found")
         conn.execute("UPDATE messages SET is_read=1 WHERE ticket_id=? AND direction='inbound'", (ticket_id,))
@@ -2110,10 +2160,11 @@ def get_reply_recipients(ticket_id: str, request: Request, parent_message_id: Op
 @app.get("/api/attachments/{attachment_id}")
 def download_attachment(attachment_id: str, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
         row = conn.execute("""SELECT a.* FROM attachments a
             JOIN tickets t ON t.id=a.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
-            WHERE a.id=? AND m.workspace_id=?""", (attachment_id, context["workspace_id"])).fetchone()
+            WHERE a.id=? AND m.workspace_id=?""" + access_sql, (attachment_id, context["workspace_id"], *access_params)).fetchone()
     if not row:
         raise HTTPException(404, detail={"error": "ATTACHMENT_NOT_FOUND"})
     path = (ROOT / row["storage_path"]).resolve()
@@ -2155,8 +2206,9 @@ def _queue_reply(conn: sqlite3.Connection, ticket: sqlite3.Row, context: dict, b
 @app.post("/api/tickets/{ticket_id}/reply")
 def reply(ticket_id: str, payload: ReplyIn, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
-        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
+        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone()
         if not ticket:
             raise HTTPException(404, "Ticket not found")
         fields_set = payload.model_fields_set if hasattr(payload, "model_fields_set") else payload.__fields_set__
@@ -2184,8 +2236,9 @@ async def reply_with_attachments(ticket_id: str, request: Request, body: str = F
     else:
         raw_to, raw_cc, raw_parent = to, cc, parent_message_id
         to_supplied, cc_supplied, parent_supplied = to is not None, cc is not None, parent_message_id is not None
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
-        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone()
+        ticket = conn.execute("SELECT t.*,m.email mailbox_email FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone()
         if not ticket:
             raise HTTPException(404, "Ticket not found")
         message_id, outbox_id = _queue_reply(conn, ticket, context, clean_body, close_after_send,
@@ -2210,7 +2263,7 @@ def compose_mail(payload: ComposeMailIn, request: Request):
     with db() as conn:
         mailbox = conn.execute("SELECT id,name,email FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1",
             (payload.mailbox_id, context["workspace_id"])).fetchone()
-        if not mailbox:
+        if not mailbox or not mailbox_access_allowed(conn, context, payload.mailbox_id):
             raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
         sequence = conn.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id,5) AS INTEGER)),1048)+1 FROM tickets").fetchone()[0]
         ticket_id, message_id = f"TKT-{sequence}", str(uuid.uuid4())
@@ -2250,7 +2303,7 @@ async def compose_mail_with_attachments(request: Request, mailbox_id: str = Form
     with db() as conn:
         mailbox = conn.execute("SELECT id,name,email FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1",
             (mailbox_id, context["workspace_id"])).fetchone()
-        if not mailbox:
+        if not mailbox or not mailbox_access_allowed(conn, context, mailbox_id):
             raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
         sequence = conn.execute("SELECT COALESCE(MAX(CAST(SUBSTR(id,5) AS INTEGER)),1048)+1 FROM tickets").fetchone()[0]
         ticket_id, message_id, outbox_id = f"TKT-{sequence}", str(uuid.uuid4()), str(uuid.uuid4())
@@ -2279,12 +2332,13 @@ async def compose_mail_with_attachments(request: Request, mailbox_id: str = Form
 @app.patch("/api/tickets/{ticket_id}")
 def update_ticket(ticket_id: str, changes: dict, request: Request):
     context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     allowed = {"status", "priority", "assignee", "ai_category"}
     fields = {k: v for k, v in changes.items() if k in allowed}
     if not fields:
         raise HTTPException(400, "No supported fields")
     with db() as conn:
-        if not conn.execute("SELECT 1 FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?", (ticket_id, context["workspace_id"])).fetchone():
+        if not conn.execute("SELECT 1 FROM tickets t JOIN mailboxes m ON m.id=t.mailbox_id WHERE t.id=? AND m.workspace_id=?" + access_sql, (ticket_id, context["workspace_id"], *access_params)).fetchone():
             raise HTTPException(404, "Ticket not found")
         if "status" in fields and fields["status"] not in {"open", "pending", "resolved"}:
             raise HTTPException(422, "Invalid status")
@@ -2322,6 +2376,8 @@ def receive_mail_http(mail: IncomingMail, request: Request):
     with db() as conn:
         if not conn.execute('SELECT 1 FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1',
                             (mail.mailbox_id,context['workspace_id'])).fetchone():
+            raise HTTPException(403, detail={"error": "MAILBOX_FORBIDDEN"})
+        if not mailbox_access_allowed(conn, context, mail.mailbox_id):
             raise HTTPException(403, detail={"error": "MAILBOX_FORBIDDEN"})
     return receive_mail(mail)
 
@@ -2380,9 +2436,14 @@ def receive_mail(mail: IncomingMail):
 
 
 @app.get("/api/outbox")
-def outbox():
+def outbox(request: Request):
+    context = current_context(request)
+    access_sql, access_params = mailbox_access_filter(context)
     with db() as conn:
-        rows = [row_dict(x) for x in conn.execute("SELECT * FROM outbox ORDER BY created_at DESC LIMIT 50")]
+        rows = [row_dict(x) for x in conn.execute("""SELECT o.* FROM outbox o
+            JOIN tickets t ON t.id=o.ticket_id JOIN mailboxes m ON m.id=t.mailbox_id
+            WHERE m.workspace_id=?""" + access_sql + " ORDER BY o.created_at DESC LIMIT 50",
+            (context["workspace_id"], *access_params))]
     return {"ok": True, "items": rows}
 
 

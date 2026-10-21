@@ -102,6 +102,14 @@ CREATE TABLE IF NOT EXISTS workspace_memberships (
 );
 CREATE INDEX IF NOT EXISTS idx_memberships_workspace ON workspace_memberships(workspace_id);
 
+-- Optional per-user mailbox scope. A user with no rows keeps workspace-wide access;
+-- once rows exist, only the listed mailboxes are visible and writable to that user.
+CREATE TABLE IF NOT EXISTS user_mailbox_access (
+  user_id TEXT NOT NULL REFERENCES users(id), mailbox_id TEXT NOT NULL REFERENCES mailboxes(id),
+  created_at TEXT NOT NULL, PRIMARY KEY(user_id, mailbox_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_mailbox_access_mailbox ON user_mailbox_access(mailbox_id);
+
 -- Feishu is additive: no users, memberships or subscriptions are seeded.
 CREATE TABLE IF NOT EXISTS feishu_bindings (
  user_id TEXT PRIMARY KEY REFERENCES users(id), app_id TEXT NOT NULL, tenant_key TEXT NOT NULL,
