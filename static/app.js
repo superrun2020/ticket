@@ -225,9 +225,42 @@ function openComposePage(){if(!state.mailboxes?.length)return toast('当前工�
 $('#composeButton').onclick=openComposePage;
 
 async function openMailboxAdmin(){if(!state.session?.user?.is_admin)return toast('需要管理员权限');const dialog=$('#mailboxAdminDialog');dialog.showModal();$('#mailboxAdminContent').innerHTML='<div class="mail-service-empty"><b>正在读取邮箱…</b>请稍候</div>';try{const d=await api('/api/admin/mailboxes');$('#mailboxAdminContent').innerHTML=`<div class="mailbox-admin-grid">${d.mailboxes.map(m=>`<article class="mailbox-admin-card"><div><h3>${esc(m.email)}</h3><p>${esc(m.workspace_name||m.workspace_id)} · ${esc(m.mailbox_tag)} · ${esc(m.provider)}</p><small>IMAP ${esc(m.config.imap_host)}:${m.config.imap_port} · SMTP ${esc(m.config.smtp_host)}:${m.config.smtp_port}</small></div><div class="mailbox-admin-actions"><button type="button" class="tool-button" data-copy-text="${esc(m.email)}">复制邮箱</button><button type="button" class="tool-button" data-copy-config="${esc(m.id)}">复制 SMTP/IMAP</button><button type="button" class="tool-button" data-copy-secret="${esc(m.id)}" ${m.password_available?'':'disabled'}>复制密码</button></div></article>`).join('')}</div>`;document.querySelectorAll('[data-copy-text]').forEach(b=>b.onclick=()=>copyText(b.dataset.copyText,'已复制邮箱'));document.querySelectorAll('[data-copy-config]').forEach(b=>b.onclick=async()=>{const m=d.mailboxes.find(x=>x.id===b.dataset.copyConfig);if(m)copyText(`Email: ${m.email}\nIMAP: ${m.config.imap_host}:${m.config.imap_port} SSL\nIMAP username: ${m.config.imap_username}\nSMTP: ${m.config.smtp_host}:${m.config.smtp_port} ${m.config.smtp_ssl?'SSL':'STARTTLS'}\nSMTP username: ${m.config.smtp_username}`,'已复制 SMTP/IMAP 配置')});document.querySelectorAll('[data-copy-secret]').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const s=await api(`/api/admin/mailboxes/${encodeURIComponent(b.dataset.copySecret)}/secret`,{method:'POST'});await copyText(s.password,'已复制邮箱密码')}finally{b.disabled=false}})}catch(e){$('#mailboxAdminContent').innerHTML='<div class="mail-service-error"><b>邮箱管理加载失败</b>请确认当前账户是管理员。</div>'}}
-async function copyText(text,message){await navigator.clipboard.writeText(text);toast(message)}
+async function copyText(text,message){try{if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(text);else{const area=document.createElement('textarea');area.value=text;area.setAttribute('readonly','');area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();const copied=document.execCommand('copy');area.remove();if(!copied)throw new Error('CLIPBOARD_UNAVAILABLE')}toast(message);return true}catch(error){toast('复制失败，请检查浏览器剪贴板权限');return false}}
 $('#mailboxAdminNav').onclick=openMailboxAdmin;
 $('#closeMailboxAdmin').onclick=()=>$('#mailboxAdminDialog').close();
+
+async function openMailboxClientConfig(mailboxId){
+  const dialog=$('#mailboxClientConfigDialog');
+  if(!dialog||!mailboxId)return;
+  dialog.showModal();
+  $('#mailboxClientConfigContent').innerHTML='<div class="mail-service-empty"><b>正在读取客户端登录信息…</b>请稍候</div>';
+  try{
+    const d=await api(`/api/mailboxes/${encodeURIComponent(mailboxId)}/client-config`,{method:'POST'});
+    const c=d.config||{},password=d.password||'',imapEncryption=c.imap_ssl?'SSL/TLS':'STARTTLS',smtpEncryption=c.smtp_ssl?'SSL/TLS':'STARTTLS';
+    const copyAll=[
+      `邮箱：${d.email}`,
+      `密码：${password}`,
+      `IMAP服务器：${c.imap_host}`,
+      `IMAP端口：${c.imap_port}`,
+      `IMAP加密：${imapEncryption}`,
+      `IMAP用户名：${c.imap_username}`,
+      `IMAP文件夹：${c.imap_folder}`,
+      `SMTP服务器：${c.smtp_host}`,
+      `SMTP端口：${c.smtp_port}`,
+      `SMTP加密：${smtpEncryption}`,
+      `SMTP用户名：${c.smtp_username}`,
+    ].join('\n');
+    const field=(label,value,key)=>`<div class="client-config-field"><span>${label}</span><strong>${esc(value)}</strong><button type="button" class="tool-button client-config-copy" data-client-copy="${esc(value)}" data-client-copy-label="${esc(label)}" title="复制${label}">复制</button></div>`;
+    $('#mailboxClientConfigContent').innerHTML=`<div class="client-config-head"><div><h3>${esc(d.email)}</h3><p>使用下面的参数登录 Outlook、Foxmail、Apple Mail 等客户端。</p></div><button type="button" class="send" id="mailboxClientCopyAll">一键复制全部信息</button></div><div class="client-config-notice">密码仅向当前授权邮箱返回，复制后请妥善保管。建议客户端优先使用 SSL/TLS。</div><section class="client-config-section"><h3>账户</h3><div class="client-config-fields"><div class="client-config-field"><span>邮箱</span><strong>${esc(d.email)}</strong><button type="button" class="tool-button client-config-copy" data-client-copy="${esc(d.email)}" data-client-copy-label="邮箱">复制</button></div><div class="client-config-field client-config-password"><span>密码</span><div class="client-config-secret"><input id="mailboxClientPassword" type="password" value="${esc(password)}" readonly autocomplete="off"><button type="button" class="tool-button" id="toggleMailboxClientPassword">显示</button></div><button type="button" class="tool-button client-config-copy" data-client-copy="${esc(password)}" data-client-copy-label="密码">复制</button></div></div></section><section class="client-config-section"><h3>IMAP 收件</h3><div class="client-config-fields">${field('服务器',c.imap_host,'imap_host')}${field('端口',c.imap_port,'imap_port')}${field('加密方式',imapEncryption,'imap_ssl')}${field('用户名',c.imap_username,'imap_username')}${field('文件夹',c.imap_folder,'imap_folder')}</div></section><section class="client-config-section"><h3>SMTP 发件</h3><div class="client-config-fields">${field('服务器',c.smtp_host,'smtp_host')}${field('端口',c.smtp_port,'smtp_port')}${field('加密方式',smtpEncryption,'smtp_ssl')}${field('用户名',c.smtp_username,'smtp_username')}</div></section>`;
+    $('#mailboxClientCopyAll').onclick=()=>copyText(copyAll,'已复制全部客户端登录信息');
+    $('#toggleMailboxClientPassword').onclick=event=>{const input=$('#mailboxClientPassword'),visible=input.type==='text';input.type=visible?'password':'text';event.currentTarget.textContent=visible?'显示':'隐藏'};
+    document.querySelectorAll('#mailboxClientConfigContent [data-client-copy]').forEach(button=>button.onclick=()=>copyText(button.dataset.clientCopy,`已复制${button.dataset.clientCopyLabel}`));
+  }catch(error){
+    const message=String(error?.message||'');
+    $('#mailboxClientConfigContent').innerHTML=`<div class="mail-service-error"><b>客户端登录信息读取失败</b>${message.includes('MAILBOX_PASSWORD_NOT_AVAILABLE')?'当前邮箱没有可用密码配置，请联系管理员补充。':'当前账户没有权限查看该邮箱，或服务暂时不可用。'}</div>`;
+  }
+}
+$('#closeMailboxClientConfig').onclick=()=>$('#mailboxClientConfigDialog').close();
 
 // Mail-client presentation layer. It keeps the existing ticket APIs and actions,
 // but makes the primary workflow read like an inbox instead of a ticket queue.
@@ -282,6 +315,12 @@ function renderNav(d){
     quickSwitcher.value=selected;
     quickSwitcher.disabled=!availableMailboxes.length;
     quickSwitcher.onchange=event=>{void selectMailbox(event.target.value,quickSwitcher)};
+  }
+  const selectedMailboxId=availableMailboxes.some(mailbox=>mailbox.id===state.mailbox)?state.mailbox:(quickSwitcher?.value||availableMailboxes[0]?.id||'');
+  const clientConfigNav=$('#mailboxClientConfigNav');
+  if(clientConfigNav){
+    clientConfigNav.hidden=!selectedMailboxId;
+    clientConfigNav.onclick=()=>{if(selectedMailboxId)void openMailboxClientConfig(selectedMailboxId)};
   }
   $('#mailboxNav').innerHTML=availableMailboxes.map(mailbox=>`<div class="mailbox-row ${state.mailbox===mailbox.id?'active':''}"><button class="nav-item mailbox ${state.mailbox===mailbox.id?'active':''}" data-mailbox="${esc(mailbox.id)}" title="${esc(mailbox.email)}"><i class="dot" style="background:${esc(mailbox.color||'#8b84dc')}"></i><span>${esc(mailbox.name)}<small>${esc(mailbox.email)} · ${esc(mailbox.mailbox_tag||'未分类')}</small></span><b>${mailbox.ticket_count||0}</b></button>${state.mailbox===mailbox.id?`<button type="button" class="mailbox-refresh" data-mailbox-refresh aria-label="刷新 ${esc(mailbox.name)} 邮箱列表" title="刷新 ${esc(mailbox.name)} 邮箱列表">↻</button>`:''}</div>`).join('');
   document.querySelectorAll('[data-mailbox]').forEach(button=>button.onclick=()=>{void selectMailbox(button.dataset.mailbox,quickSwitcher)});

@@ -1637,6 +1637,35 @@ def admin_mailbox_secret(mailbox_id: str, request: Request):
     return {"ok": True, "email": mailbox["email"], "password": password, "config": public_mailbox_config(dict(mailbox), cfg)}
 
 
+@app.post("/api/mailboxes/{mailbox_id}/client-config")
+def mailbox_client_config(mailbox_id: str, request: Request):
+    """Return client login details only for a mailbox in the user's scope."""
+    context = current_context(request)
+    configs = mailbox_runtime_configs()
+    cfg = configs.get(mailbox_id)
+    with db() as conn:
+        mailbox = conn.execute(
+            "SELECT * FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1",
+            (mailbox_id, context["workspace_id"]),
+        ).fetchone()
+        if not mailbox or not mailbox_access_allowed(conn, context, mailbox_id):
+            raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
+    password = (cfg or {}).get("password")
+    if not password:
+        raise HTTPException(404, detail={"error": "MAILBOX_PASSWORD_NOT_AVAILABLE"})
+    logging.getLogger("ticket-audit").info(
+        "mailbox client config accessed actor=%s mailbox=%s workspace=%s ip=%s",
+        context["username"], mailbox_id, context["workspace_id"],
+        request.client.host if request.client else "unknown",
+    )
+    return {
+        "ok": True,
+        "email": mailbox["email"],
+        "password": password,
+        "config": public_mailbox_config(dict(mailbox), cfg),
+    }
+
+
 @app.post("/api/admin/mail-service/sync")
 def sync_mail_service(request: Request):
     context = require_admin(request)

@@ -46,8 +46,11 @@ test('delegated mail-list click opens a ticket after the list is redrawn', () =>
 test('mail navigation exposes a mailbox selector and cache-busted app script', () => {
   assert.match(indexSource, /id="mailboxQuickSwitcher"/);
   assert.match(indexSource, /邮箱列表/);
-  assert.match(indexSource, /app\.js\?v=20261021-mailbox-switcher-2/);
+  assert.match(indexSource, /app\.js\?v=20261021-mailbox-client-config-1/);
   assert.match(appSource, /quickSwitcher\.onchange=event=>\{void selectMailbox\(event\.target\.value,quickSwitcher\)\}/);
+  assert.match(indexSource, /id="mailboxClientConfigNav"/);
+  assert.match(appSource, /\/api\/mailboxes\/\$\{encodeURIComponent\(mailboxId\)\}\/client-config/);
+  assert.match(appSource, /一键复制全部信息/);
 });
 
 test('workspace changes clear the previous mailbox filter before reloading', () => {

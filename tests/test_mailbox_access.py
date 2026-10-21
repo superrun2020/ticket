@@ -13,6 +13,7 @@ class MailboxAccessTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.original_db_path = ticket_app.DB_PATH
+        self.original_runtime_configs = ticket_app.mailbox_runtime_configs
         ticket_app.DB_PATH = Path(self.tempdir.name) / "tickets.db"
         ticket_app.init_db()
         with ticket_app.db() as conn:
@@ -52,6 +53,7 @@ class MailboxAccessTests(unittest.TestCase):
 
     def tearDown(self):
         ticket_app.DB_PATH = self.original_db_path
+        ticket_app.mailbox_runtime_configs = self.original_runtime_configs
         self.tempdir.cleanup()
 
     def test_list_and_session_are_scoped_to_granted_mailbox(self):
@@ -83,6 +85,48 @@ class MailboxAccessTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as update:
             ticket_app.update_ticket("TKT-2", {"status": "resolved"}, self.request)
         self.assertEqual(404, update.exception.status_code)
+
+    def test_granted_mailbox_can_read_client_login_config(self):
+        ticket_app.mailbox_runtime_configs = lambda: {
+            "allowed-box": {
+                "password": "synthetic-password",
+                "imap_host": "imap.example.test",
+                "imap_port": 993,
+                "username": "oliver@woyonexus.com",
+                "smtp_host": "smtp.example.test",
+                "smtp_port": 465,
+                "smtp_ssl": True,
+                "smtp_username": "oliver@woyonexus.com",
+            },
+        }
+
+        result = ticket_app.mailbox_client_config("allowed-box", self.request)
+
+        self.assertEqual("oliver@woyonexus.com", result["email"])
+        self.assertEqual("synthetic-password", result["password"])
+        self.assertEqual("imap.example.test", result["config"]["imap_host"])
+        self.assertEqual("smtp.example.test", result["config"]["smtp_host"])
+        self.assertEqual("oliver@woyonexus.com", result["config"]["imap_username"])
+
+    def test_client_login_config_cannot_cross_mailbox_scope(self):
+        ticket_app.mailbox_runtime_configs = lambda: {
+            "blocked-box": {"password": "synthetic-password"},
+        }
+
+        with self.assertRaises(HTTPException) as detail:
+            ticket_app.mailbox_client_config("blocked-box", self.request)
+
+        self.assertEqual(404, detail.exception.status_code)
+
+    def test_client_login_config_rejects_mailbox_without_password(self):
+        ticket_app.mailbox_runtime_configs = lambda: {
+            "allowed-box": {"imap_host": "imap.example.test"},
+        }
+
+        with self.assertRaises(HTTPException) as detail:
+            ticket_app.mailbox_client_config("allowed-box", self.request)
+
+        self.assertEqual(404, detail.exception.status_code)
 
     def test_unconfigured_user_keeps_workspace_wide_behavior(self):
         with ticket_app.db() as conn:
