@@ -3,6 +3,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
@@ -85,6 +86,48 @@ class MailboxAccessTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as update:
             ticket_app.update_ticket("TKT-2", {"status": "resolved"}, self.request)
         self.assertEqual(404, update.exception.status_code)
+
+    def test_mailbox_settings_are_scoped_and_return_dns_without_credentials(self):
+        with ticket_app.db() as conn:
+            ts = ticket_app.now()
+            conn.execute(
+                "INSERT INTO mail_service_domains(id,name,description,enabled,dns_zone_file,synced_at) VALUES(?,?,?,?,?,?)",
+                ("domain-1", "woyonexus.com", "Test domain", 1, "secret zone material", ts),
+            )
+            conn.execute(
+                "INSERT INTO mail_service_accounts(id,email,display_name,domain_name,enabled,synced_at) VALUES(?,?,?,?,?,?)",
+                ("account-1", "oliver@woyonexus.com", "Oliver", "woyonexus.com", 1, ts),
+            )
+        readiness = {
+            "checks": [{"id": "mx", "name": "MX 收信路由", "passed": True, "detail": "已指向 mail2.willech.com"}],
+            "passed_count": 1,
+            "complete": False,
+            "checked_at": "2026-11-11T00:00:00+08:00",
+            "dns": {"active": True, "nameservers": ["ns1.example.test"], "addresses": [],
+                    "mx_active": True, "mx_expected": "10 mail2.willech.com.", "mx_records": ["10 mail2.willech.com."],
+                    "spf_records": [], "dmarc_records": [], "dkim": []},
+        }
+        with patch.object(ticket_app, "mail_tls_ready", return_value=True), patch.object(
+            ticket_app, "domain_mail_status", return_value=readiness
+        ):
+            result = ticket_app.mailbox_settings("allowed-box", self.request)
+        self.assertEqual("oliver@woyonexus.com", result["mailbox"]["email"])
+        self.assertEqual(["ns1.example.test"], result["domain"]["readiness"]["dns"]["nameservers"])
+        self.assertTrue(result["service_account"]["enabled"])
+        self.assertNotIn("password", str(result).lower())
+        self.assertNotIn("secret zone material", str(result))
+
+    def test_mailbox_settings_reject_unauthorized_and_cross_workspace_mailboxes(self):
+        with ticket_app.db() as conn:
+            ts = ticket_app.now()
+            conn.execute(
+                "INSERT INTO mailboxes(id,name,email,color,created_at,workspace_id) VALUES(?,?,?,?,?,?)",
+                ("other-workspace-box", "Other workspace", "cross-workspace@woyonexus.com", "#222", ts, "geekforest"),
+            )
+        for mailbox_id in ("blocked-box", "other-workspace-box"):
+            with self.subTest(mailbox_id=mailbox_id), self.assertRaises(HTTPException) as detail:
+                ticket_app.mailbox_settings(mailbox_id, self.request)
+            self.assertEqual(404, detail.exception.status_code)
 
     def test_granted_mailbox_can_read_client_login_config(self):
         ticket_app.mailbox_runtime_configs = lambda: {

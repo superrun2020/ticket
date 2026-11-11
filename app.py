@@ -765,12 +765,12 @@ def mail_tls_ready() -> bool:
     return ready
 
 
-def domain_mail_status(domain: dict, tls_ready: bool) -> dict:
+def domain_mail_status(domain: dict, tls_ready: bool, force: bool = False) -> dict:
     name = domain["name"]
     zone = domain.get("dns_zone_file", "")
     cache_key = hashlib.sha256(f"{domain['enabled']}:{zone}".encode()).hexdigest()
     cached = mail_domain_status_cache.get(name)
-    if cached and time.time() - cached[0] < 300 and cached[1] == cache_key:
+    if not force and cached and time.time() - cached[0] < 300 and cached[1] == cache_key:
         result = dict(cached[2])
         result["checks"] = [dict(x) if x["id"] != "tls" else {**x, "passed": tls_ready,
             "detail": "IMAP 与 SMTP TLS 均可用" if tls_ready else "Mail2 TLS 连接异常"} for x in result["checks"]]
@@ -778,6 +778,8 @@ def domain_mail_status(domain: dict, tls_ready: bool) -> dict:
         result["complete"] = result["passed_count"] == 6
         return result
     mx_records = dns_short(name, "MX")
+    ns_records = dns_short(name, "NS")
+    a_records = dns_short(name, "A")
     txt_records = dns_short(name, "TXT")
     dmarc_records = dns_short(f"_dmarc.{name}", "TXT")
     logical_lines, pending = [], ""
@@ -820,7 +822,11 @@ def domain_mail_status(domain: dict, tls_ready: bool) -> dict:
             "detail": "IMAP 与 SMTP TLS 均可用" if tls_ready else "Mail2 TLS 连接异常"},
     ]
     result = {"checks": checks, "passed_count": sum(1 for x in checks if x["passed"]),
-        "complete": all(x["passed"] for x in checks), "checked_at": now()}
+        "complete": all(x["passed"] for x in checks), "checked_at": now(),
+        "dns": {"active": bool(ns_records and (a_records or mx_records or txt_records or dmarc_records or any(dkim_results))), "nameservers": ns_records, "addresses": a_records,
+            "mx_active": mx_ok, "mx_expected": "10 mail2.willech.com.", "mx_records": mx_records,
+            "spf_records": spf_values, "dmarc_records": dmarc_records,
+            "dkim": [{"selector": selector, "records": values} for selector, values in zip(selector_names, dkim_results)]}}
     mail_domain_status_cache[name] = (time.time(), cache_key, result)
     return result
 
@@ -1570,6 +1576,42 @@ def mail_service_catalog(request: Request):
     tag_suggestions = {w["id"]: list(mailbox_tags_for_workspace(w["id"])) for w in workspaces}
     return {"ok": True, "service": {"live": live, "warning": warning}, "domains": domains,
         "mailboxes": accounts, "workspaces": workspaces, "tag_suggestions": tag_suggestions}
+
+
+@app.get("/api/mailboxes/{mailbox_id}/settings")
+def mailbox_settings(mailbox_id: str, request: Request, refresh: bool = False):
+    context = current_context(request)
+    with db() as conn:
+        mailbox = conn.execute("""SELECT id,name,email,enabled,workspace_id,mailbox_tag
+            FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1""",
+            (mailbox_id, context["workspace_id"])).fetchone()
+        if not mailbox or not mailbox_access_allowed(conn, context, mailbox_id):
+            raise HTTPException(404, detail={"error": "MAILBOX_NOT_FOUND"})
+        email_address = str(mailbox["email"] or "").strip().lower()
+        domain_name = email_address.rsplit("@", 1)[1] if "@" in email_address else ""
+        domain = conn.execute("""SELECT id,name,description,enabled,synced_at,dns_zone_file
+            FROM mail_service_domains WHERE lower(name)=lower(?) LIMIT 1""", (domain_name,)).fetchone()
+        service_account = conn.execute("""SELECT id,enabled,synced_at FROM mail_service_accounts
+            WHERE lower(email)=lower(?) LIMIT 1""", (email_address,)).fetchone()
+    readiness = None
+    if domain:
+        if refresh:
+            mail_domain_status_cache.pop(domain_name, None)
+        readiness = domain_mail_status(dict(domain), mail_tls_ready(), force=refresh)
+    return {
+        "ok": True,
+        "mailbox": {"id": mailbox["id"], "name": mailbox["name"], "email": email_address,
+            "workspace_id": mailbox["workspace_id"], "mailbox_tag": mailbox["mailbox_tag"],
+            "enabled": bool(mailbox["enabled"])},
+        "service_account": {"exists": bool(service_account),
+            "enabled": bool(service_account["enabled"]) if service_account else False,
+            "synced_at": service_account["synced_at"] if service_account else ""},
+        "domain": {"name": domain_name, "exists": bool(domain),
+            "enabled": bool(domain["enabled"]) if domain else False,
+            "description": domain["description"] if domain else "",
+            "synced_at": domain["synced_at"] if domain else "",
+            "readiness": readiness},
+    }
 
 
 def mailbox_runtime_configs() -> dict[str, dict]:
@@ -2500,7 +2542,7 @@ def index():
 
 @app.get("/static/{filename}")
 def static(filename: str):
-    if filename not in {"feishu-ui.js", "feishu.css", "feishu.js", "mobile.css", "mobile.js", "app.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "mail-client.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
+    if filename not in {"feishu-ui.js", "feishu.css", "feishu.js", "mobile.css", "mobile.js", "app.js", "mailbox-tools.js", "mail-refresh.js", "styles.css", "login.js", "login.css", "overrides.css", "settings.css", "scrollfix.css", "workspaces.css", "tags.css", "branding.css", "label-picker.css", "translate-button.css", "mail-client.css", "ticket-logo.png", "apple-touch-icon.png", "favicon.ico"}:
         raise HTTPException(404)
     return FileResponse(ROOT / "static" / filename, headers={"Cache-Control": "public, max-age=300, stale-while-revalidate=86400"})
 

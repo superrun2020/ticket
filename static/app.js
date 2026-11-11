@@ -130,6 +130,7 @@ $('#mailServiceNav').onclick=openMailService;
 $('#syncMailService').onclick=async()=>{const button=$('#syncMailService');button.disabled=true;button.textContent='同步中…';try{const result=await api('/api/admin/mail-service/sync',{method:'POST'});toast(`已同步 ${result.domains} 个域名、${result.mailboxes} 个邮箱`);await loadMailService(true)}catch(e){toast('Mail2 同步失败，请稍后重试')}finally{button.disabled=false;button.textContent='同步 Mail2'}};
 $('#openAiFromSettings').onclick=()=>{$('#mailServiceDialog').close();openAiSettings()};
 $('#aiSettingsButton').onclick=openAiSettings;
+window.TicketMailboxUI?.init({state,api,esc,selectMailbox});
 startApp();
 // Allow comma/semicolon/newline-separated To recipients in the full composer.
 const composeButtonHandler=$('#composeButton').onclick;$('#composeButton').onclick=()=>{composeButtonHandler();const field=$('#composePageTo');if(field){field.type='text';field.placeholder='name@example.com，可输入多个地址'}};
