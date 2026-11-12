@@ -17,7 +17,7 @@ function applySession(d){state.session=d;$('#workspaceSwitcher').innerHTML=d.wor
 async function switchWorkspace(targetWorkspace,selector=$('#workspaceSwitcher'),authorizedOperation=null){if(state.workspaceSwitchPending)return false;const originalWorkspace=state.session.user.workspace_id;state.workspaceSwitchPending=true;selector.disabled=true;beginWorkspaceSwitch();try{try{if(authorizedOperation)await authorizedOperation();else await api('/api/workspaces/switch',{method:'POST',body:JSON.stringify({workspace_id:targetWorkspace})})}catch(error){/* The server may have switched before the response failed; verify below. */}let actualSession;try{actualSession=await api('/api/session')}catch(error){toast('无法确认工作区切换结果，请重试切换');return false}const actualWorkspace=actualSession.user.workspace_id;if(actualWorkspace===originalWorkspace){state.session=actualSession;workspaceSessionDefinitive=true;selector.value=originalWorkspace;if(refreshController)await refreshController.resumeWorkspace(originalWorkspace);if(targetWorkspace&&targetWorkspace!==originalWorkspace)toast('工作区切换失败，已恢复当前工作区');await reconcilePendingReplySends();return false}applySession(actualSession);state.mailbox=state.displayMode==='ticket'?'all':(actualSession.default_mailbox_id||'all');state.mailFolder='inbox';workspaceSessionDefinitive=true;await reconcilePendingReplySends();state.selected=null;$('#detail').innerHTML=emptyHtml();if(refreshController)await refreshController.workspaceChanged();await load();return true}finally{state.workspaceSwitchPending=false;selector.disabled=false;globalThis.FeishuUI?.changed()}}
 let restoringMailboxUrl = false;
 function updateMailboxUrl(push = false) {
-  if (restoringMailboxUrl) return;
+  if (restoringMailboxUrl || typeof window === 'undefined' || !window.location?.href) return;
   const url = new URL(window.location.href);
   const mailbox = (state.mailboxes || []).find(item => item.id === state.mailbox);
   if (mailbox) {
@@ -59,7 +59,7 @@ async function loadSession() {
   updateMailboxUrl();
   if (state.mailbox !== 'all') await refreshSelectedMailbox($('#refreshTickets'));
 }
-window.addEventListener('popstate', () => {
+if (typeof window !== 'undefined') window.addEventListener('popstate', () => {
   beginWorkspaceSwitch();
   resetSelectedTicketView();
   void loadSession().then(() => refreshController?.workspaceChanged()).catch(() => toast('邮箱链接加载失败，请重试'));
