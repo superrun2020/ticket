@@ -2140,6 +2140,37 @@ def list_tickets(request: Request, status: Optional[str] = None, mailbox: Option
     return {"ok": True, "tickets": tickets, "has_more": has_more, "next_offset": page_offset + len(tickets), "counts": counts, "summary": {"unprocessed": counts.get("open", 0), "unread_messages": unread_messages}, "mailboxes": boxes, "tag_options": tag_options, "category_options": category_options, "category_counts": category_counts}
 
 
+@app.post("/api/mailboxes/{mailbox_id}/sync")
+def sync_selected_mailbox(mailbox_id: str, request: Request):
+    context = current_context(request)
+    origin = os.getenv('TICKET_PUBLIC_BASE_URL', '').rstrip('/') or str(request.base_url).rstrip('/')
+    if request.headers.get('origin') != origin:
+        raise HTTPException(403, detail={'error': 'ORIGIN_REJECTED'})
+    with db() as conn:
+        mailbox = conn.execute('SELECT id FROM mailboxes WHERE id=? AND workspace_id=? AND enabled=1',
+                               (mailbox_id, context['workspace_id'])).fetchone()
+        if not mailbox or not mailbox_access_allowed(conn, context, mailbox_id):
+            raise HTTPException(403, detail={'error': 'MAILBOX_FORBIDDEN'})
+    if worker is None:
+        raise HTTPException(503, detail={'error': 'MAIL_WORKER_UNAVAILABLE'})
+    from mail_worker import _managed_stalwart_configs, load_configs
+    configs = _managed_stalwart_configs(ROOT)
+    cfg = next((item for item in configs if item['id'] == mailbox_id), None)
+    if cfg is None:
+        cfg = next((item for item in load_configs(ROOT) if item['id'] == mailbox_id), None)
+    if cfg is None:
+        raise HTTPException(404, detail={'error': 'MAILBOX_CONFIG_MISSING'})
+    try:
+        worker.sync_mailbox(cfg)
+    except RuntimeError as exc:
+        if str(exc) == 'MAILBOX_SYNC_BUSY':
+            raise HTTPException(409, detail={'error': 'MAILBOX_SYNC_BUSY'})
+        raise HTTPException(502, detail={'error': 'MAILBOX_SYNC_FAILED'})
+    except Exception:
+        raise HTTPException(502, detail={'error': 'MAILBOX_SYNC_FAILED'})
+    return {'ok': True, 'mailbox_id': mailbox_id}
+
+
 @app.get("/api/mail/inbound-cursor")
 def inbound_message_cursor(request: Request, since: Optional[int] = None):
     """Read-only workspace feed used to notice mail already ingested into tickets."""

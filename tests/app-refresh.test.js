@@ -79,30 +79,32 @@ test('load rejects a request invalidated by workspace generation even after A to
 function sidebarRefreshHarness({mailbox='A042A'}={}) {
   const requests = [], toasts = [];
   const button = {disabled:false, textContent:'↻', attributes:{}, setAttribute(name,value){this.attributes[name]=value}, removeAttribute(name){delete this.attributes[name]}};
+  let loads = 0;
   const context = {
     URLSearchParams, JSON,
     state:{status:'open',mailbox,tag:'vip',q:'needle',view:'mine',priority:'urgent',category:'billing',sort:'oldest',tickets:[],selected:'T1',session:{user:{workspace_id:'W1'}}},
     listRequestSequence:0, workspaceGeneration:0,
-    api:url=>{const pending=deferred();requests.push({url,pending});return pending.promise},
+    api:(url,options)=>{const pending=deferred();requests.push({url,options,pending});return pending.promise},
+    load:async()=>{loads++},
     renderList(){},renderNav(){},toast:message=>toasts.push(message),
   };
   vm.createContext(context);
-  vm.runInContext(extract('async function load(', 'function applySession(')+extract('async function refreshSelectedMailbox(', 'function renderNav('), context);
-  return {context,requests,toasts,button};
+  vm.runInContext(extract('async function refreshSelectedMailbox(', 'function renderNav('), context);
+  return {context,requests,toasts,button,loads:()=>loads};
 }
 
-test('sidebar refresh requests only the captured mailbox with existing filters', async () => {
+test('sidebar refresh syncs the captured mailbox before reloading its list', async () => {
   const h=sidebarRefreshHarness();
   const refresh=h.context.refreshSelectedMailbox(h.button);
   assert.equal(h.requests.length,1);
-  const params=new URL(h.requests[0].url,'https://example.test').searchParams;
-  assert.equal(params.get('mailbox'),'A042A');
-  assert.deepEqual(Object.fromEntries(params),{status:'open',mailbox:'A042A',tag:'vip',q:'needle',view:'mine',priority:'urgent',category:'billing',sort:'oldest'});
+  assert.equal(h.requests[0].url,'/api/mailboxes/A042A/sync');
+  assert.equal(h.requests[0].options.method,'POST');
   assert.equal(h.button.disabled,true);
-  h.requests[0].pending.resolve(payload('NEW'));
+  h.requests[0].pending.resolve({ok:true});
   await refresh;
+  assert.equal(h.loads(),1);
   assert.equal(h.button.disabled,false);
-  assert.match(h.toasts.at(-1),/A042A.*刷新/);
+  assert.equal(h.toasts.at(-1),'邮箱收取完成');
 });
 
 test('sidebar refresh does nothing without a concrete mailbox and prevents duplicate clicks', async () => {
@@ -113,7 +115,9 @@ test('sidebar refresh does nothing without a concrete mailbox and prevents dupli
   const first=h.context.refreshSelectedMailbox(h.button);
   assert.equal(await h.context.refreshSelectedMailbox(h.button),false);
   assert.equal(h.requests.length,1);
-  h.requests[0].pending.resolve(payload('NEW'));await first;
+  h.requests[0].pending.resolve({ok:true});
+  await first;
+  assert.equal(h.loads(),1);
 });
 
 test('sidebar refresh rejection restores its button', async () => {
@@ -131,7 +135,7 @@ test('sidebar refresh suppresses stale notification after switching during reque
   const refresh=h.context.refreshSelectedMailbox(h.button);
   h.context.state.mailbox='B055B';
   h.context.listRequestSequence++;
-  h.requests[0].pending.resolve(payload('STALE'));
+  h.requests[0].pending.resolve({ok:true});
   await refresh;
   assert.deepEqual(h.toasts,[]);
 });
