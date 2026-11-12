@@ -12,10 +12,58 @@ async function finishReplyResult(record){if(!workspaceSessionDefinitive){deferRe
 async function reconcilePendingReplySends(){const records=pendingReplySends.splice(0);for(const record of records)await finishReplyResult(record)}
 function currentListFilters(){return {status:state.status,mailbox:state.mailbox,tag:state.tag,q:state.q,view:state.view,priority:state.priority,category:state.category,sort:state.sort}}
 function listFilterKey(filters){const value=filters||{};return JSON.stringify({status:value.status||'all',mailbox:value.mailbox||'all',tag:value.tag||'all',q:value.q||'',view:value.view||'all',priority:value.priority||'all',category:value.category||'all',sort:value.sort||'latest'})}
-async function load(options={}){const workspace=state.session?.user.workspace_id,generation=workspaceGeneration,requestSequence=++listRequestSequence,append=options.append===true,filters=options.filters||currentListFilters(),p=new URLSearchParams(filters);const d=await api('/api/tickets?'+p);if(requestSequence!==listRequestSequence||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id||listFilterKey(filters)!==listFilterKey(currentListFilters())||options.expectedWorkspace&&options.expectedWorkspace!==workspace)return false;state.tickets=append?[...state.tickets,...d.tickets]:d.tickets;state.listHasMore=Boolean(d.has_more);state.mailboxes=(d.mailboxes||[]).filter(x=>x.enabled);state.categoryOptions=(d.category_options||[]).filter(x=>x!=='待分类');renderList();renderNav(d);return true}
+async function load(options={}){const workspace=state.session?.user.workspace_id,generation=workspaceGeneration,requestSequence=++listRequestSequence,append=options.append===true,filters=options.filters||currentListFilters(),p=new URLSearchParams(filters);const d=await api('/api/tickets?'+p);if(requestSequence!==listRequestSequence||generation!==workspaceGeneration||workspace!==state.session?.user.workspace_id||listFilterKey(filters)!==listFilterKey(currentListFilters())||options.expectedWorkspace&&options.expectedWorkspace!==workspace)return false;state.tickets=append?[...state.tickets,...d.tickets]:d.tickets;state.listHasMore=Boolean(d.has_more);state.mailboxes=(d.mailboxes||[]).filter(x=>x.enabled);state.categoryOptions=(d.category_options||[]).filter(x=>x!=='待分类');renderList();renderNav(d);updateMailboxUrl();return true}
 function applySession(d){state.session=d;$('#workspaceSwitcher').innerHTML=d.workspaces.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join('');$('#workspaceSwitcher').value=d.user.workspace_id;$('#profileName').textContent=d.user.display_name;$('#profileAvatar').textContent=initials(d.user.display_name).slice(0,1);$('#profileRole').textContent=d.user.is_admin?'管理员':'成员';$('#userAdminNav').hidden=!d.user.is_admin;$('#googleMailboxNav').hidden=!d.user.is_admin;$('#mailboxAdminNav').hidden=!d.user.is_admin;$('#mailServiceNav').hidden=!d.user.is_admin;$('#telegramNav').hidden=!d.user.is_admin;$('#userAdminButton').hidden=!d.user.is_admin;$('#workspaceSwitcher').onchange=e=>switchWorkspace(e.target.value,e.target)}
 async function switchWorkspace(targetWorkspace,selector=$('#workspaceSwitcher'),authorizedOperation=null){if(state.workspaceSwitchPending)return false;const originalWorkspace=state.session.user.workspace_id;state.workspaceSwitchPending=true;selector.disabled=true;beginWorkspaceSwitch();try{try{if(authorizedOperation)await authorizedOperation();else await api('/api/workspaces/switch',{method:'POST',body:JSON.stringify({workspace_id:targetWorkspace})})}catch(error){/* The server may have switched before the response failed; verify below. */}let actualSession;try{actualSession=await api('/api/session')}catch(error){toast('无法确认工作区切换结果，请重试切换');return false}const actualWorkspace=actualSession.user.workspace_id;if(actualWorkspace===originalWorkspace){state.session=actualSession;workspaceSessionDefinitive=true;selector.value=originalWorkspace;if(refreshController)await refreshController.resumeWorkspace(originalWorkspace);if(targetWorkspace&&targetWorkspace!==originalWorkspace)toast('工作区切换失败，已恢复当前工作区');await reconcilePendingReplySends();return false}applySession(actualSession);state.mailbox=state.displayMode==='ticket'?'all':(actualSession.default_mailbox_id||'all');state.mailFolder='inbox';workspaceSessionDefinitive=true;await reconcilePendingReplySends();state.selected=null;$('#detail').innerHTML=emptyHtml();if(refreshController)await refreshController.workspaceChanged();await load();return true}finally{state.workspaceSwitchPending=false;selector.disabled=false;globalThis.FeishuUI?.changed()}}
-async function loadSession(){const d=await api('/api/session');applySession(d);state.mailbox=state.displayMode==='ticket'?'all':(d.default_mailbox_id||'all');workspaceSessionDefinitive=true;await reconcilePendingReplySends();await load()}
+let restoringMailboxUrl = false;
+function updateMailboxUrl(push = false) {
+  if (restoringMailboxUrl) return;
+  const url = new URL(window.location.href);
+  const mailbox = (state.mailboxes || []).find(item => item.id === state.mailbox);
+  if (mailbox) {
+    url.searchParams.set('mailbox', mailbox.email);
+    url.searchParams.set('workspace', state.session.user.workspace_id);
+  } else {
+    url.searchParams.delete('mailbox');
+    url.searchParams.delete('workspace');
+  }
+  if (url.href !== window.location.href) {
+    window.history[push ? 'pushState' : 'replaceState'](null, '', url);
+  }
+}
+async function loadSession() {
+  const params = new URL(window.location.href).searchParams;
+  const email = params.get('mailbox');
+  const workspace = params.get('workspace');
+  restoringMailboxUrl = true;
+  try {
+    let session = await api('/api/session');
+    if (workspace && workspace !== session.user.workspace_id) {
+      if (!session.workspaces.some(item => item.id === workspace)) throw new Error('MAILBOX_WORKSPACE_FORBIDDEN');
+      await api('/api/workspaces/switch', {method: 'POST', body: JSON.stringify({workspace_id: workspace})});
+      session = await api('/api/session');
+    }
+    applySession(session);
+    state.mailbox = state.displayMode === 'ticket' ? 'all' : (session.default_mailbox_id || 'all');
+    workspaceSessionDefinitive = true;
+    await reconcilePendingReplySends();
+    await load();
+    if (email) {
+      const mailbox = state.mailboxes.find(item => item.email.toLowerCase() === email.toLowerCase());
+      if (mailbox) await selectMailbox(mailbox.id);
+      else toast('当前账户无法访问此邮箱');
+    }
+  } finally {
+    restoringMailboxUrl = false;
+  }
+  updateMailboxUrl();
+  if (state.mailbox !== 'all') await refreshSelectedMailbox($('#refreshTickets'));
+}
+window.addEventListener('popstate', () => {
+  beginWorkspaceSwitch();
+  resetSelectedTicketView();
+  void loadSession().then(() => refreshController?.workspaceChanged()).catch(() => toast('邮箱链接加载失败，请重试'));
+});
 function showLoadError(){const list=$('#ticketList');list.innerHTML='<div class="empty"><span>↻</span><h2>工单载入失败</h2><p>网络刚才出现波动，请重新载入。</p><button class="tool-button" id="retryLoad" type="button">重新载入</button></div>';$('#retryLoad').onclick=()=>startApp()}
 async function startApp(){const list=$('#ticketList');list.innerHTML='<div class="loading">正在载入工单…</div>';for(let attempt=0;attempt<2;attempt++){try{await loadSession();if(!refreshController)await setupMailRefresh();void globalThis.FeishuUI?.ready();return}catch(error){if(error.message==='AUTH_REQUIRED')return;if(attempt===0)await new Promise(resolve=>setTimeout(resolve,1000))}}showLoadError()}
 async function setupMailRefresh(){
@@ -28,9 +76,31 @@ async function setupMailRefresh(){
   if(!('Notification' in window)||Notification.permission==='denied')permissionButton.hidden=true;else if(Notification.permission==='granted'){permissionButton.textContent='浏览器通知已开启';permissionButton.disabled=true}
   permissionButton.onclick=async()=>{try{const result=await alertPreferences.requestNotificationPermission();if(result==='granted'){permissionButton.textContent='浏览器通知已开启';permissionButton.disabled=true;toast('浏览器通知已开启')}else toast('浏览器通知未开启')}catch(error){toast('浏览器通知权限请求失败，请检查浏览器设置')}};
   refreshController=MailRefresh.createMailRefreshController({getWorkspace:()=>state.session?.user.workspace_id,fetchCursor:since=>api('/api/mail/inbound-cursor'+(since==null?'':`?since=${encodeURIComponent(since)}`)),refreshList:workspace=>load({preserveDetail:true,expectedWorkspace:workspace}),onMessages:messages=>{toast(messages.length===1?`收到新邮件：${messages[0].subject}`:`收到 ${messages.length} 封新邮件`);alertPreferences.alert(messages[0])},onStatus:update=>{const box=$('.refresh-tools'),button=$('#refreshTickets'),status=$('#refreshStatus');button.disabled=update.phase==='loading';button.textContent=update.phase==='loading'?'正在刷新列表…':'刷新工单列表';box.classList.toggle('error',update.phase==='error');if(update.phase==='success')status.textContent=`上次刷新 ${update.refreshedAt.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;if(update.phase==='error')status.textContent='列表刷新失败，请重试'},isVisible:()=>document.visibilityState==='visible'});
-  $('#refreshTickets').onclick=()=>refreshController.refresh('manual');document.addEventListener('visibilitychange',()=>refreshController.visibilityChanged());window.addEventListener('beforeunload',()=>refreshController.stop());await refreshController.start();
+  $('#refreshTickets').onclick=()=>state.mailbox && state.mailbox !== 'all' ? refreshSelectedMailbox($('#refreshTickets')) : refreshController.refresh('manual');document.addEventListener('visibilitychange',()=>refreshController.visibilityChanged());window.addEventListener('beforeunload',()=>refreshController.stop());await refreshController.start();
 }
-async function refreshSelectedMailbox(button){const mailbox=state.mailbox;if(!mailbox||mailbox==='all'||button.disabled)return false;const workspace=state.session?.user.workspace_id,generation=workspaceGeneration,filters={status:state.status,mailbox,tag:state.tag,q:state.q,view:state.view,priority:state.priority,category:state.category,sort:state.sort};button.disabled=true;button.setAttribute('aria-busy','true');button.textContent='…';const request=load({filters,expectedWorkspace:workspace}),requestSequence=listRequestSequence;try{const accepted=await request;if(!accepted||requestSequence!==listRequestSequence)return false;toast(`${mailbox} 邮箱列表已刷新`);return true}catch(error){if(requestSequence===listRequestSequence&&generation===workspaceGeneration&&workspace===state.session?.user.workspace_id&&JSON.stringify(filters)===JSON.stringify({status:state.status,mailbox:state.mailbox,tag:state.tag,q:state.q,view:state.view,priority:state.priority,category:state.category,sort:state.sort}))toast(`${mailbox} 邮箱列表刷新失败，请重试`);return false}finally{button.disabled=false;button.removeAttribute('aria-busy');button.textContent='↻'}}
+async function refreshSelectedMailbox(button) {
+  const mailbox = state.mailbox;
+  if (!mailbox || mailbox === 'all' || button.disabled) return false;
+  const workspace = state.session?.user.workspace_id;
+  const generation = workspaceGeneration;
+  button.disabled = true;
+  button.setAttribute('aria-busy', 'true');
+  try {
+    await api(`/api/mailboxes/${encodeURIComponent(mailbox)}/sync`, {method: 'POST'});
+    if (workspace !== state.session?.user.workspace_id || generation !== workspaceGeneration || mailbox !== state.mailbox) return false;
+    await load();
+    toast('邮箱收取完成');
+    return true;
+  } catch (error) {
+    if (workspace === state.session?.user.workspace_id && generation === workspaceGeneration && mailbox === state.mailbox) {
+      toast(error.message.includes('MAILBOX_SYNC_BUSY') ? '邮箱正在收取，请稍后刷新' : '邮箱收取失败，请重试');
+    }
+    return false;
+  } finally {
+    button.disabled = false;
+    button.removeAttribute('aria-busy');
+  }
+}
 function renderNav(d){const total=Object.values(d.counts).reduce((a,b)=>a+b,0);$('#allCount').textContent=total;$('#unprocessedMetric').textContent=d.summary?.unprocessed||0;$('#unreadMetric').textContent=d.summary?.unread_messages||0;['open','pending','resolved'].forEach(x=>$(`#${x}Count`).textContent=d.counts[x]||0);const categories=['all',...d.category_options];$('#categoryChips').innerHTML=categories.map(x=>`<button class="category-chip ${state.category===x?'active':''}" data-category="${esc(x)}">${x==='all'?'✦ 全部':esc(x)} <b>${x==='all'?total:(d.category_counts[x]||0)}</b></button>`).join('');document.querySelectorAll('[data-category]').forEach(b=>b.onclick=()=>{state.category=b.dataset.category;load()});$('#tagNav').innerHTML=d.tag_options.filter(x=>x!=='未分类').map(tag=>`<button class="nav-item tag-filter ${state.tag===tag?'active':''}" data-tag="${esc(tag)}"><span>🏷</span>${esc(tag)}</button>`).join('');$('#mailboxNav').innerHTML=d.mailboxes.map(m=>`<div class="mailbox-row ${state.mailbox===m.id?'active':''}"><button class="nav-item mailbox ${state.mailbox===m.id?'active':''}" data-mailbox="${esc(m.id)}" title="${esc(m.email)}"><i class="dot" style="background:${m.color}"></i><span>${esc(m.name)}<small>${esc(m.email)} · ${esc(m.mailbox_tag)}</small></span><b>${m.ticket_count||0}</b></button>${state.mailbox===m.id?`<button type="button" class="mailbox-refresh" data-mailbox-refresh aria-label="刷新 ${esc(m.name)} 邮箱列表" title="刷新 ${esc(m.name)} 邮箱列表">↻</button>`:''}</div>`).join('');document.querySelectorAll('[data-mailbox]').forEach(b=>b.onclick=()=>{state.mailbox=state.mailbox===b.dataset.mailbox?'all':b.dataset.mailbox;state.tag='all';load()});document.querySelectorAll('[data-mailbox-refresh]').forEach(b=>b.onclick=()=>refreshSelectedMailbox(b));document.querySelectorAll('[data-tag]').forEach(b=>b.onclick=()=>{state.tag=state.tag===b.dataset.tag?'all':b.dataset.tag;state.mailbox='all';load()})}
 function renderList(){if(!state.tickets.length){$('#ticketList').innerHTML='<div class="empty"><span>⌕</span><h2>没有找到工单</h2><p>试试调整筛选条件。</p></div>';return}$('#ticketList').innerHTML=state.tickets.map(t=>`<article class="ticket-card ${t.id===state.selected?'active':''}" data-id="${t.id}"><div class="card-top"><div class="customer-avatar">${esc(initials(t.customer_name))}</div><div class="customer">${esc(t.customer_name)}</div>${t.unread?'<i class="unread"></i>':''}<span class="time">${relativeTime(t.updated_at)}</span></div><div class="subject">${esc(t.subject)}</div><div class="preview">${esc(t.preview)}</div><div class="card-meta"><span class="badge ${t.status}">${statusLabel[t.status]}</span><span class="badge ai-category ${t.ai_category==='疑似垃圾邮件'?'spam':''}">✦ ${esc(t.ai_category||'待分类')}</span><span class="badge">${esc(t.mailbox_name)}</span><span class="priority ${t.priority}">${t.priority==='normal'?'':priorityLabel[t.priority]}</span></div></article>`).join('');document.querySelectorAll('.ticket-card').forEach(c=>c.onclick=()=>openTicket(c.dataset.id))}
 function relativeTime(s){const mins=Math.max(1,Math.round((Date.now()-new Date(s).getTime())/60000));return mins<60?`${mins} 分钟前`:mins<1440?`${Math.floor(mins/60)} 小时前`:`${Math.floor(mins/1440)} 天前`}
@@ -283,6 +353,7 @@ async function selectMailbox(mailbox,control=null){
   if(!available.some(item=>item.id===mailbox))return false;
   if(state.mailbox===mailbox&&!state.selected)return true;
   state.mailbox=mailbox;state.status='all';state.view='all';state.priority='all';state.category='all';state.tag='all';state.mailFolder='inbox';resetSelectedTicketView();
+  updateMailboxUrl(true);
   if(control)control.disabled=true;
   $('#ticketList').innerHTML='<div class="loading">正在载入所选邮箱…</div>';
   try{return await load({filters:mailboxFilters(mailbox)})}

@@ -367,6 +367,20 @@ class MailWorker:
         self.thread: threading.Thread | None = None
         self.config_cursor = 0
         self.last_project_mail_service_sync = 0.0
+        self.mailbox_locks = {}
+        self.mailbox_locks_guard = threading.Lock()
+
+    def sync_mailbox(self, cfg, send=False):
+        with self.mailbox_locks_guard:
+            lock = self.mailbox_locks.setdefault(cfg['id'], threading.Lock())
+        if not lock.acquire(timeout=1):
+            raise RuntimeError('MAILBOX_SYNC_BUSY')
+        try:
+            self._receive_box(cfg)
+            if send:
+                self._send_box(cfg)
+        finally:
+            lock.release()
 
     def start(self):
         if os.getenv("TICKET_MAIL_WORKER", "1") == "0" or self.thread:
@@ -394,8 +408,7 @@ class MailWorker:
                     selected = configs
                 for cfg in selected:
                     try:
-                        self._receive_box(cfg)
-                        self._send_box(cfg)
+                        self.sync_mailbox(cfg, send=True)
                     except Exception:
                         log.exception("mailbox cycle failed for %s", cfg.get("id"))
                 try:
@@ -456,7 +469,7 @@ class MailWorker:
 
     def _receive_box(self, cfg):
         from app import IncomingMail
-        client = imaplib.IMAP4_SSL(cfg["imap_host"], int(cfg.get("imap_port", 993)), ssl_context=ssl.create_default_context())
+        client = imaplib.IMAP4_SSL(cfg["imap_host"], int(cfg.get("imap_port", 993)), ssl_context=ssl.create_default_context(), timeout=20)
         try:
             client.login(cfg.get("username", cfg["email"]), self._password(cfg))
             client.select(cfg.get("imap_folder", "INBOX"))
